@@ -259,7 +259,7 @@ class UmiDataset(BaseDataset):
         dataloader = torch.utils.data.DataLoader(
             dataset=self,
             batch_size=64,
-            num_workers=32,
+            num_workers=8,
         )
         for batch in tqdm(dataloader, desc='iterating dataset to get normalization'):
             for key in self.lowdim_keys:
