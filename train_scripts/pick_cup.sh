@@ -5,16 +5,18 @@ now_date=$(date "+%Y.%m.%d")
 run_dir="data/outputs/${now_date}/${now_seconds}"
 echo ${run_dir}
 
-# accelerate launch --mixed_precision 'bf16' ../train.py \
-python ../train.py \
+# python ../train.py \
+accelerate launch --mixed_precision 'bf16' ../train.py \
 --config-name=train_diffusion_unet_timm_umi_workspace \
 multi_run.run_dir=${run_dir} multi_run.wandb_name_base=${logging_time} hydra.run.dir=${run_dir} hydra.sweep.dir=${run_dir} \
 task.dataset_path=../data/dataset/${task_name}/dataset.zarr.zip \
 training.num_epochs=100 \
-dataloader.batch_size=16 \
-dataloader.num_workers=8 \
-val_dataloader.num_workers=8 \
+dataloader.batch_size=8 \
+dataloader.num_workers=4 \
+val_dataloader.num_workers=4 \
 logging.name="${logging_time}_${task_name}" \
 policy.obs_encoder.model_name='vit_large_patch14_dinov2.lvd142m' \
 task.dataset.use_ratio=1.0 \
-task.dataset.val_ratio=0.1 
+task.dataset.val_ratio=0.1 \
+training.gradient_accumulate_every=2 \
+training.rollout_every=101
