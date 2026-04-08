@@ -37,7 +37,8 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 logger = logging.getLogger(__name__)
 
-class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
+
+class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
     exclude_keys = tuple()
 
@@ -58,17 +59,17 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
 
-        # configure training state
-        # self.optimizer = hydra.utils.instantiate(
-        #     cfg.optimizer, params=self.model.parameters())
+        # configure optimizer / layer decay
         if cfg.training.layer_decay < 1.0:
             assert not cfg.policy.obs_encoder.use_lora
             assert not cfg.policy.obs_encoder.share_rgb_model
-            obs_encorder_param_groups = param_groups_lrd(self.model.obs_encoder,
-                                                         shape_meta=cfg.shape_meta,
-                                                         weight_decay=cfg.optimizer.encoder_weight_decay,
-                                                         no_weight_decay_list=self.model.obs_encoder.no_weight_decay(),
-                                                         layer_decay=cfg.training.layer_decay)
+            obs_encorder_param_groups = param_groups_lrd(
+                self.model.obs_encoder,
+                shape_meta=cfg.shape_meta,
+                weight_decay=cfg.optimizer.encoder_weight_decay,
+                no_weight_decay_list=self.model.obs_encoder.no_weight_decay(),
+                layer_decay=cfg.training.layer_decay,
+            )
             count = 0
             for group in obs_encorder_param_groups:
                 count += len(group['params'])
@@ -83,7 +84,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             obs_encorder_lr = cfg.optimizer.lr
             if cfg.policy.obs_encoder.pretrained and not cfg.policy.obs_encoder.use_lora:
                 obs_encorder_lr *= cfg.training.encoder_lr_coefficient
-                print('==> reduce pretrained obs_encorder\'s lr')
+                print("==> reduce pretrained obs_encorder's lr")
             obs_encorder_params = list()
             for param in self.model.obs_encoder.parameters():
                 if param.requires_grad:
@@ -91,7 +92,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             print(f'obs_encorder params: {len(obs_encorder_params)}')
             param_groups = [
                 {'params': self.model.model.parameters()},
-                {'params': obs_encorder_params, 'lr': obs_encorder_lr}
+                {'params': obs_encorder_params, 'lr': obs_encorder_lr},
             ]
         optimizer_cfg = OmegaConf.to_container(cfg.optimizer, resolve=True)
         optimizer_cfg.pop('_target_')
@@ -99,28 +100,34 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             optimizer_cfg.pop('encoder_weight_decay')
         self.optimizer = torch.optim.AdamW(
             params=param_groups,
-            **optimizer_cfg
+            **optimizer_cfg,
         )
 
         # configure training state
         self.global_step = 0
         self.epoch = 0
 
-        # do not save optimizer if resume=False
         if not cfg.training.resume:
             self.exclude_keys = ['optimizer']
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
-        accelerator = Accelerator(log_with='wandb')
-        wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
-        wandb_cfg.pop('project')
-        accelerator.init_trackers(
-            project_name=cfg.logging.project,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            init_kwargs={"wandb": wandb_cfg}
-        )
+        use_wandb = cfg.logging.get("use_wandb", True)
+        accelerator = Accelerator(log_with='wandb' if use_wandb else None)
+        if use_wandb:
+            wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
+            wandb_cfg.pop('project')
+            wandb_cfg.pop('use_wandb', None)
+            accelerator.init_trackers(
+                project_name=cfg.logging.project,
+                config=OmegaConf.to_container(cfg, resolve=True),
+                init_kwargs={"wandb": wandb_cfg},
+            )
+
+        finetune_from = cfg.training.get("finetune_from", None)
+        if cfg.training.resume and finetune_from:
+            raise ValueError("Cannot set both training.resume and training.finetune_from")
 
         # resume training
         if cfg.training.resume:
@@ -128,6 +135,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+
+        # finetune from a checkpoint (weights only, reset optimizer)
+        if finetune_from:
+            accelerator.print(f"Finetuning from checkpoint {finetune_from}")
+            self.load_checkpoint(path=finetune_from, exclude_keys=["optimizer"])
+            if cfg.training.get("reset_steps_on_finetune", True):
+                self.global_step = 0
+                self.epoch = 0
 
         # configure dataset
         dataset: BaseImageDataset
@@ -146,24 +161,35 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         accelerator.wait_for_everyone()
         normalizer = pickle.load(open(normalizer_path, 'rb'))
 
-        # configure validation dataset
+        # configure validation datasets (supports dict for DAgger splits)
         val_dataset = dataset.get_validation_dataset()
-        val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
-        
+        if isinstance(val_dataset, dict):
+            val_dataloaders = {k: DataLoader(v, **cfg.val_dataloader) for k, v in val_dataset.items()}
+        else:
+            val_dataloaders = {"val": DataLoader(val_dataset, **cfg.val_dataloader)}
+
         if cfg.training.use_in_the_wild_val:
             in_the_wild_val_dataloader_dict = {}
             for in_the_wild_type in cfg.training.in_the_wild_type:
                 in_the_wild_val_dataloader_dict[in_the_wild_type] = []
                 for i, wild_dataset_index in enumerate(os.listdir(os.path.join(cfg.task.in_the_wild_dataset.dataset_path, in_the_wild_type))):
                     wild_dataset_config = copy.deepcopy(cfg.task.in_the_wild_dataset)
-                    wild_dataset_config['dataset_path'] = os.path.join(wild_dataset_config['dataset_path'], in_the_wild_type, wild_dataset_index, 'dataset.zarr.zip')
+                    wild_dataset_config['dataset_path'] = os.path.join(
+                        wild_dataset_config['dataset_path'], in_the_wild_type, wild_dataset_index, 'dataset.zarr.zip'
+                    )
                     in_the_wild_val_dataset = hydra.utils.instantiate(wild_dataset_config)
                     in_the_wild_val_dataloader = DataLoader(in_the_wild_val_dataset, **cfg.val_dataloader)
                     in_the_wild_val_dataloader_dict[in_the_wild_type].append(in_the_wild_val_dataloader)
                     if accelerator.is_main_process:
-                        print(f'{i} th {in_the_wild_type} dataset:', len(in_the_wild_val_dataset), f'{i} th {in_the_wild_type} dataloader:', len(in_the_wild_val_dataloader))
+                        print(
+                            f"{i} th {in_the_wild_type} dataset:",
+                            len(in_the_wild_val_dataset),
+                            f"{i} th {in_the_wild_type} dataloader:",
+                            len(in_the_wild_val_dataloader),
+                        )
         print('train dataset:', len(dataset), 'train dataloader:', len(train_dataloader))
-        print('val dataset:', len(val_dataset), 'val dataloader:', len(val_dataloader))
+        for k, v in val_dataloaders.items():
+            print(f'val dataset [{k}]:', len(v.dataset), 'val dataloader:', len(v))
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -174,41 +200,20 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
-            # pytorch assumes stepping LRScheduler every epoch
-            # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            num_training_steps=(len(train_dataloader) * cfg.training.num_epochs)
+            // cfg.training.gradient_accumulate_every,
+            last_epoch=self.global_step - 1,
         )
 
-        # configure ema
         ema: EMAModel = None
         if cfg.training.use_ema:
-            ema = hydra.utils.instantiate(
-                cfg.ema,
-                model=self.ema_model)
+            ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
 
-        # configure env
         env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
+        env_runner = hydra.utils.instantiate(cfg.task.env_runner, output_dir=self.output_dir)
         assert isinstance(env_runner, BaseImageRunner)
 
-        # # configure logging
-        # wandb_run = wandb.init(
-        #     dir=str(self.output_dir),
-        #     config=OmegaConf.to_container(cfg, resolve=True),
-        #     **cfg.logging
-        # )
-        # wandb.config.update(
-        #     {
-        #         "output_dir": self.output_dir,
-        #     }
-        # )
-
-        # configure checkpoint
+        # checkpoint monitor key tailored for DAgger
         if cfg.checkpoint.only_save_recent:
             cfg.checkpoint.topk.monitor_key = 'epoch'
         elif cfg.training.use_in_the_wild_val:
@@ -221,25 +226,31 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             assert cfg.training.checkpoint_every >= cfg.training.wild_sample_every and cfg.training.checkpoint_every % cfg.training.wild_sample_every == 0
             assert cfg.training.num_epochs // cfg.training.wild_sample_every <= 30
         else:
-            cfg.checkpoint.topk.monitor_key = 'val_action_mse_error'
+            # prefer mixed validation for ranking
+            cfg.checkpoint.topk.monitor_key = 'val_mixed_action_mse_error'
             assert cfg.training.checkpoint_every >= cfg.training.sample_every and cfg.training.checkpoint_every % cfg.training.sample_every == 0
         cfg.checkpoint.topk.format_str = 'epoch={epoch:04d}-' + cfg.checkpoint.topk.monitor_key + '={' + cfg.checkpoint.topk.monitor_key + ':.5f}.ckpt'
         topk_manager = TopKCheckpointManager(
             save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
+            **cfg.checkpoint.topk,
         )
 
-        # device transfer
-        # device = torch.device(cfg.training.device)
-        # self.model.to(device)
-        # if self.ema_model is not None:
-        #     self.ema_model.to(device)
-        # optimizer_to(self.optimizer, device)
-
-        # accelerator
-        train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler = accelerator.prepare(
-            train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler
+        # accelerator preparation (supports multiple val loaders)
+        prepared = accelerator.prepare(
+            train_dataloader,
+            *val_dataloaders.values(),
+            self.model,
+            self.optimizer,
+            lr_scheduler,
         )
+        train_dataloader = prepared[0]
+        val_prepared = prepared[1 : 1 + len(val_dataloaders)]
+        for (k, _), loader in zip(val_dataloaders.items(), val_prepared):
+            val_dataloaders[k] = loader
+        self.model = prepared[1 + len(val_dataloaders)]
+        self.optimizer = prepared[2 + len(val_dataloaders)]
+        lr_scheduler = prepared[3 + len(val_dataloaders)]
+
         if cfg.training.use_in_the_wild_val:
             for key in in_the_wild_val_dataloader_dict.keys():
                 in_the_wild_val_dataloader_list = in_the_wild_val_dataloader_dict[key]
@@ -250,7 +261,6 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         if self.ema_model is not None:
             self.ema_model.to(device)
 
-        # save batch for sampling
         train_sampling_batch = None
 
         if cfg.training.debug:
@@ -267,17 +277,25 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             cfg.training.get("enable_fp32_fallback", True),
         )
 
-        # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
                 self.model.train()
 
                 step_log = dict()
-                # ========= train for this epoch ==========
-                if cfg.training.freeze_encoder:
+                freeze_on_finetune = cfg.training.get("freeze_encoder_on_finetune", False)
+                freeze_epochs = cfg.training.get("freeze_encoder_epochs", 0)
+                should_freeze_encoder = cfg.training.freeze_encoder or (
+                    finetune_from
+                    and freeze_on_finetune
+                    and self.epoch < freeze_epochs
+                )
+                if should_freeze_encoder:
                     self.model.obs_encoder.eval()
                     self.model.obs_encoder.requires_grad_(False)
+                else:
+                    self.model.obs_encoder.train()
+                    self.model.obs_encoder.requires_grad_(True)
 
                 def _iter_tensors(value, prefix=""):
                     if torch.is_tensor(value):
@@ -331,20 +349,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     return False
 
                 train_losses = list()
-                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
-                        leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
+                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
-                        # device transfer
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                        
-                        # always use the latest batch
                         train_sampling_batch = batch
-
                         if _batch_has_non_finite(batch):
                             _log_batch_summary(batch, reason="non-finite batch")
                             continue
-
-                        # compute loss
                         try:
                             raw_loss = self.model(batch)
                             if not torch.isfinite(raw_loss).all():
@@ -360,7 +371,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                     "CUDA error during backward; falling back to fp32 for this batch.",
                                     exc_info=True,
                                 )
+
                                 _log_batch_summary(batch, reason="cuda error")
+
                                 self.optimizer.zero_grad(set_to_none=True)
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
@@ -376,17 +389,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             else:
                                 raise
 
-                        # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
-                        
-                        # update ema
+
                         if cfg.training.use_ema:
                             ema.step(accelerator.unwrap_model(self.model))
 
-                        # logging
                         raw_loss_cpu = raw_loss.item()
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
@@ -394,55 +404,30 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             'train/loss': raw_loss_cpu,
                             'global_step': self.global_step,
                             'train/epoch': self.epoch,
-                            'train/lr': lr_scheduler.get_last_lr()[0]
+                            'train/lr': lr_scheduler.get_last_lr()[0],
                         }
 
-                        is_last_batch = (batch_idx == (len(train_dataloader)-1))
+                        is_last_batch = batch_idx == (len(train_dataloader) - 1)
                         if not is_last_batch:
-                            # log of last step is combined with validation and rollout
                             accelerator.log(step_log, step=self.global_step)
                             json_logger.log(step_log)
                             self.global_step += 1
 
-                        if (cfg.training.max_train_steps is not None) \
-                            and batch_idx >= (cfg.training.max_train_steps-1):
+                        if (cfg.training.max_train_steps is not None) and batch_idx >= (cfg.training.max_train_steps - 1):
                             break
 
-                # at the end of each epoch
-                # replace train_loss with epoch average
                 train_loss = np.mean(train_losses)
                 step_log['train/loss'] = train_loss
 
-                # ========= eval for this epoch ==========
                 policy = accelerator.unwrap_model(self.model)
                 if cfg.training.use_ema:
                     policy = self.ema_model
                 policy.eval()
 
-                # run rollout
                 if (self.epoch % cfg.training.rollout_every) == 0:
                     runner_log = env_runner.run(policy)
-                    # log all
                     step_log.update(runner_log)
 
-                # run validation
-                # if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0 and accelerator.is_main_process:
-                #     with torch.no_grad():
-                #         val_losses = list()
-                #         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
-                #                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                #             for batch_idx, batch in enumerate(tepoch):
-                #                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                #                 loss = self.model(batch)
-                #                 val_losses.append(loss)
-                #                 if (cfg.training.max_val_steps is not None) \
-                #                     and batch_idx >= (cfg.training.max_val_steps-1):
-                #                     break
-                #         if len(val_losses) > 0:
-                #             val_loss = torch.mean(torch.tensor(val_losses)).item()
-                #             # log epoch average validation loss
-                #             step_log['val_loss'] = val_loss
-                
                 def log_action_mse(step_log, category, pred_action, gt_action):
                     B, T, _ = pred_action.shape
                     pred_action = pred_action.view(B, T, -1, 10)
@@ -451,7 +436,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     step_log[f'{category}_action_mse_error_pos'] = torch.nn.functional.mse_loss(pred_action[..., :3], gt_action[..., :3])
                     step_log[f'{category}_action_mse_error_rot'] = torch.nn.functional.mse_loss(pred_action[..., 3:9], gt_action[..., 3:9])
                     step_log[f'{category}_action_mse_error_width'] = torch.nn.functional.mse_loss(pred_action[..., 9], gt_action[..., 9])
-                
+
                 def cal_action_mse(pred_action, gt_action):
                     B, T, _ = pred_action.shape
                     pred_action = pred_action.view(B, T, -1, 10)
@@ -474,8 +459,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                     gt_action = batch['action']
                                     pred_action = policy.predict_action(batch['obs'], None)['action_pred']
                                     all_preds, all_gt = accelerator.gather_for_metrics((pred_action, gt_action))
-                                    action_mse_error, action_mse_error_pos, action_mse_error_rot, action_mse_error_width = \
-                                        cal_action_mse(all_preds, all_gt)
+                                    action_mse_error, action_mse_error_pos, action_mse_error_rot, action_mse_error_width = cal_action_mse(all_preds, all_gt)
                                     action_mse_error_list.append(action_mse_error)
                                     action_mse_error_pos_list.append(action_mse_error_pos)
                                     action_mse_error_rot_list.append(action_mse_error_rot)
@@ -488,7 +472,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                     'val_action_mse_error': val_action_mse_error,
                                     'val_action_mse_error_pos': val_action_mse_error_pos,
                                     'val_action_mse_error_rot': val_action_mse_error_rot,
-                                    'val_action_mse_error_width': val_action_mse_error_width
+                                    'val_action_mse_error_width': val_action_mse_error_width,
                                 })
                                 step_log[f'{i}_{key}_val_action_mse_error'] = val_action_mse_error
                                 step_log[f'{i}_{key}_val_action_mse_error_pos'] = val_action_mse_error_pos
@@ -498,45 +482,39 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             step_log[f'{key}_val_action_mse_error_pos'] = np.mean([x['val_action_mse_error_pos'] for x in in_the_wild_loss_list])
                             step_log[f'{key}_val_action_mse_error_rot'] = np.mean([x['val_action_mse_error_rot'] for x in in_the_wild_loss_list])
                             step_log[f'{key}_val_action_mse_error_width'] = np.mean([x['val_action_mse_error_width'] for x in in_the_wild_loss_list])
-                
-                # run diffusion sampling on a training batch
+
                 if ((self.epoch % cfg.training.sample_every) == 0 or self.epoch == cfg.training.num_epochs - 1):
                     with torch.no_grad():
-                        # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         gt_action = batch['action']
                         pred_action = policy.predict_action(batch['obs'], None)['action_pred']
                         all_preds, all_gt = accelerator.gather_for_metrics((pred_action, gt_action))
                         log_action_mse(step_log, 'train', all_preds, all_gt)
 
-                        if len(val_dataloader) > 0:
+                        for split_name, loader in val_dataloaders.items():
                             action_mse_error_list, action_mse_error_pos_list, action_mse_error_rot_list, action_mse_error_width_list = [], [], [], []
-                            for val_sampling_batch in tqdm.tqdm(val_dataloader):
+                            for val_sampling_batch in tqdm.tqdm(loader):
                                 batch = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
                                 gt_action = batch['action']
                                 pred_action = policy.predict_action(batch['obs'], None)['action_pred']
                                 all_preds, all_gt = accelerator.gather_for_metrics((pred_action, gt_action))
-                                action_mse_error, action_mse_error_pos, action_mse_error_rot, action_mse_error_width = \
-                                    cal_action_mse(all_preds, all_gt)
+                                action_mse_error, action_mse_error_pos, action_mse_error_rot, action_mse_error_width = cal_action_mse(all_preds, all_gt)
                                 action_mse_error_list.append(action_mse_error)
                                 action_mse_error_pos_list.append(action_mse_error_pos)
                                 action_mse_error_rot_list.append(action_mse_error_rot)
                                 action_mse_error_width_list.append(action_mse_error_width)
-                            step_log['val/action_mse_error'] = torch.mean(torch.stack(action_mse_error_list)).item()
-                            step_log['val_action_mse_error_pos'] = torch.mean(torch.stack(action_mse_error_pos_list)).item()
-                            step_log['val_action_mse_error_rot'] = torch.mean(torch.stack(action_mse_error_rot_list)).item()
-                            step_log['val_action_mse_error_width'] = torch.mean(torch.stack(action_mse_error_width_list)).item()
-                            
+                            step_log[f'val/{split_name}_action_mse_error'] = torch.mean(torch.stack(action_mse_error_list)).item()
+                            step_log[f'val_{split_name}_action_mse_error_pos'] = torch.mean(torch.stack(action_mse_error_pos_list)).item()
+                            step_log[f'val_{split_name}_action_mse_error_rot'] = torch.mean(torch.stack(action_mse_error_rot_list)).item()
+                            step_log[f'val_{split_name}_action_mse_error_width'] = torch.mean(torch.stack(action_mse_error_width_list)).item()
+
                         del batch
                         del gt_action
                         del pred_action
                 accelerator.wait_for_everyone()
-                    
-                # checkpoint
+
                 if cfg.checkpoint.only_save_recent:
-                    if ((self.epoch % cfg.training.checkpoint_every) == 0 or \
-                         self.epoch == cfg.training.num_epochs - 1 or \
-                         (cfg.training.num_epochs - self.epoch) in [10, 20, 30, 40, cfg.training.num_epochs // 2]) and accelerator.is_main_process:
+                    if ((self.epoch % cfg.training.checkpoint_every) == 0 or self.epoch == cfg.training.num_epochs - 1 or (cfg.training.num_epochs - self.epoch) in [10, 20, 30, 40, cfg.training.num_epochs // 2]) and accelerator.is_main_process:
                         if_save_ckpt = True
                     else:
                         if_save_ckpt = False
@@ -545,38 +523,28 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 else:
                     if_save_ckpt = False
                 if if_save_ckpt:
-                    # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
 
-                    # checkpointing
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()
                     if cfg.checkpoint.save_last_snapshot:
                         self.save_snapshot()
 
-                    # sanitize metric names
                     metric_dict = dict()
                     for key, value in step_log.items():
                         new_key = key.replace('/', '_')
                         if new_key == 'train_epoch':
                             new_key = 'epoch'
                         metric_dict[new_key] = value
-                    
-                    # We can't copy the last checkpoint here
-                    # since save_checkpoint uses threads.
-                    # therefore at this point the file might have been empty!
+
                     if not cfg.checkpoint.only_save_recent or (cfg.training.num_epochs - self.epoch) in [10, 20, 30, 40, cfg.training.num_epochs // 2]:
                         topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-
                         if topk_ckpt_path is not None:
                             self.save_checkpoint(path=topk_ckpt_path)
 
-                    # recover the DDP model
                     self.model = model_ddp
-                # ========= eval end for this epoch ==========
-                # end of epoch
-                # log of last step is combined with validation and rollout
+
                 accelerator.log(step_log, step=self.global_step)
                 json_logger.log(step_log)
                 self.global_step += 1
@@ -584,13 +552,16 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
         accelerator.end_training()
 
+
 @hydra.main(
     version_base=None,
-    config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
-    config_name=pathlib.Path(__file__).stem)
+    config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")),
+    config_name=pathlib.Path(__file__).stem,
+)
 def main(cfg):
-    workspace = TrainDiffusionUnetImageWorkspace(cfg)
+    workspace = TrainDiffusionUnetImageDaggerWorkspace(cfg)
     workspace.run()
+
 
 if __name__ == "__main__":
     main()
