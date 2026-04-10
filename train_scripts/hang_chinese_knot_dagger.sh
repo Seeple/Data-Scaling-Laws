@@ -65,7 +65,7 @@ export ACCELERATE_LOG_LEVEL=info
 export TORCH_DATALOADER_DEBUG=INFO
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_SHOW_CPP_STACKTRACES=1
-export FINETUNE_CKPT="/home/fangyuan/project/Data-Scaling-Laws/train_scripts/data/ckpts/hang_chinese_knot_raw_teleop_3_31.ckpt"
+export FINETUNE_CKPT="/home/fangyuan/project_lab/SuperInference/third_party/data-scaling-laws/train_scripts/data/outputs/2026.03.31/16.16.44/checkpoints/latest.ckpt"
 
 # Optional: set FINETUNE_CKPT=/path/to/checkpoint.ckpt to enable finetuning
 finetune_ckpt="${FINETUNE_CKPT:-}"
@@ -81,11 +81,11 @@ accelerate launch --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@
 	multi_run.run_dir=${run_dir} multi_run.wandb_name_base=${logging_time} hydra.run.dir=${run_dir} hydra.sweep.dir=${run_dir} \
 	task.teleop_dataset_path=../data/dataset/hang_chinese_knot/teleop_data/hang_chinese_knot_raw.zarr.zip \
 	task.hitl_dataset_path=../data/dataset/hang_chinese_knot/hitl_data/vr_rtc_hitl/hang_chinese_knot_vrhitl_1.zarr.zip \
-	training.num_epochs=3 \
+	training.num_epochs=100 \
 	dataloader.batch_size=8 \
 	dataloader.num_workers=4 \
 	dataloader.persistent_workers=False \
-	val_dataloader.num_workers=4 \
+	val_dataloader.num_workers=2 \
 	optimizer.lr=1e-5 \
 	training.lr_warmup_steps=500 \
 	val_dataloader.persistent_workers=False \
