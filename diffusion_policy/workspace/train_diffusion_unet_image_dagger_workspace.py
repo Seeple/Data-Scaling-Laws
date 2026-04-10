@@ -32,6 +32,7 @@ from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.common.lr_decay import param_groups_lrd
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -114,7 +115,11 @@ class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
 
         use_wandb = cfg.logging.get("use_wandb", True)
-        accelerator = Accelerator(log_with='wandb' if use_wandb else None)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(
+            log_with='wandb' if use_wandb else None,
+            kwargs_handlers=[ddp_kwargs],
+        )
         if use_wandb:
             wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
             wandb_cfg.pop('project')
@@ -290,12 +295,13 @@ class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
                     and freeze_on_finetune
                     and self.epoch < freeze_epochs
                 )
+                model_for_freeze = accelerator.unwrap_model(self.model)
                 if should_freeze_encoder:
-                    self.model.obs_encoder.eval()
-                    self.model.obs_encoder.requires_grad_(False)
+                    model_for_freeze.obs_encoder.eval()
+                    model_for_freeze.obs_encoder.requires_grad_(False)
                 else:
-                    self.model.obs_encoder.train()
-                    self.model.obs_encoder.requires_grad_(True)
+                    model_for_freeze.obs_encoder.train()
+                    model_for_freeze.obs_encoder.requires_grad_(True)
 
                 def _iter_tensors(value, prefix=""):
                     if torch.is_tensor(value):

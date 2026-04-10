@@ -32,6 +32,7 @@ from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.common.lr_decay import param_groups_lrd
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -113,14 +114,21 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
-        accelerator = Accelerator(log_with='wandb')
-        wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
-        wandb_cfg.pop('project')
-        accelerator.init_trackers(
-            project_name=cfg.logging.project,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            init_kwargs={"wandb": wandb_cfg}
+        use_wandb = cfg.logging.get("use_wandb", True)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(
+            log_with='wandb' if use_wandb else None,
+            kwargs_handlers=[ddp_kwargs],
         )
+        if use_wandb:
+            wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
+            wandb_cfg.pop('project')
+            wandb_cfg.pop('use_wandb', None)
+            accelerator.init_trackers(
+                project_name=cfg.logging.project,
+                config=OmegaConf.to_container(cfg, resolve=True),
+                init_kwargs={"wandb": wandb_cfg}
+            )
 
         # resume training
         if cfg.training.resume:
@@ -276,8 +284,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 step_log = dict()
                 # ========= train for this epoch ==========
                 if cfg.training.freeze_encoder:
-                    self.model.obs_encoder.eval()
-                    self.model.obs_encoder.requires_grad_(False)
+                    model_for_freeze = accelerator.unwrap_model(self.model)
+                    model_for_freeze.obs_encoder.eval()
+                    model_for_freeze.obs_encoder.requires_grad_(False)
 
                 def _iter_tensors(value, prefix=""):
                     if torch.is_tensor(value):

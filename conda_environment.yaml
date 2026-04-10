@@ -9,10 +9,10 @@ dependencies:
   - pytorch=2.1.0
   - pytorch-cuda=12.1
   - torchvision=0.16.0
-  - numpy=1.24
-  - scipy=1.11
+  - numpy=1.24.4
+  - scipy=1.11.4
   - numba=0.57
-  - pandas=2.1
+  - pandas=2.1.4
   - py-opencv=4.7
   - ipykernel=6.23
   - matplotlib=3.7
@@ -35,7 +35,7 @@ dependencies:
   - timm=0.9.10
   - scikit-fda=0.9
   - cython=0.29
-  - accelerate=0.24
+  - accelerate=0.24.1
   - boto3=1.33
   - exiftool=12
   - aiohttp=3.9
@@ -59,8 +59,8 @@ dependencies:
     # implicitly depend on conda package exiftool
     - PyExifTool==0.5
     - transformers==4.36.0
-    - huggingface_hub==0.20.3
-    - tokenizers=0.15.2
+    - huggingface_hub==0.19.4
+    - tokenizers==0.15.2
     - urllib3==1.26.18
     - google-api-core==2.11.0
 
