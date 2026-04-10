@@ -26,6 +26,12 @@ from umi.common.pose_util import pose_to_mat, mat_to_pose10d
 
 register_codecs()
 
+try:
+    from imagecodecs._jpegxl import JpegxlError
+except Exception:  # pragma: no cover - fallback if imagecodecs internals change
+    class JpegxlError(Exception):
+        pass
+
 class UmiDataset(BaseDataset):
     def __init__(self,
         shape_meta: dict,
@@ -314,7 +320,22 @@ class UmiDataset(BaseDataset):
         if not self.threadpool_limits_is_applied:
             threadpool_limits(1)
             self.threadpool_limits_is_applied = True
-        data = self.sampler.sample_sequence(idx)
+        max_retries = 5
+        attempt = 0
+        while True:
+            try:
+                data = self.sampler.sample_sequence(idx)
+                break
+            except JpegxlError as exc:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                # Skip corrupted frame by resampling another index.
+                idx = int(np.random.randint(0, len(self.sampler)))
+                print(
+                    f"[UmiDataset] JpegXL decode failed (attempt {attempt}/{max_retries}). "
+                    f"Resampling idx={idx}. Error: {exc}"
+                )
 
         obs_dict = dict()
         for key in self.rgb_keys:

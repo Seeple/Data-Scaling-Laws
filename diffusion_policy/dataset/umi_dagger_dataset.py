@@ -18,6 +18,12 @@ from diffusion_policy.common.normalize_util import (
     get_range_normalizer_from_stat,
 )
 
+try:
+    from imagecodecs._jpegxl import JpegxlError
+except Exception:  # pragma: no cover - fallback if imagecodecs internals change
+    class JpegxlError(Exception):
+        pass
+
 
 class DaggerMixedUmiDataset(BaseDataset):
     """
@@ -88,10 +94,23 @@ class DaggerMixedUmiDataset(BaseDataset):
         return self.hitl_dataset if self.rng.random() < self.hitl_prob else self.teleop_dataset
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        dataset = self._sample_dataset()
-        # Re-index inside chosen dataset to avoid IndexError
-        mapped_idx = idx % len(dataset)
-        return dataset[mapped_idx]
+        max_retries = 5
+        attempt = 0
+        while True:
+            dataset = self._sample_dataset()
+            # Re-index inside chosen dataset to avoid IndexError
+            mapped_idx = idx % len(dataset)
+            try:
+                return dataset[mapped_idx]
+            except JpegxlError as exc:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                idx = int(self.rng.integers(0, len(self)))
+                print(
+                    f"[DaggerMixedUmiDataset] JpegXL decode failed (attempt {attempt}/{max_retries}). "
+                    f"Resampling idx={idx}. Error: {exc}"
+                )
 
     # ==================== validation datasets ====================
     def get_validation_dataset(self):
@@ -115,7 +134,7 @@ class DaggerMixedUmiDataset(BaseDataset):
         # build a temporary dataloader to iterate once
         num_workers = kwargs.get("num_workers", self.normalizer_num_workers)
         if num_workers is None:
-            num_workers = 0
+            num_workers = 8
         dataloader = DataLoader(self, batch_size=64, num_workers=num_workers)
         for batch in tqdm(dataloader, desc="iterating mixed dataset to get normalization"):
             for key in self.lowdim_keys:

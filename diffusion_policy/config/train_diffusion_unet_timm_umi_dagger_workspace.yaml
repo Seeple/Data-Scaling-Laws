@@ -169,7 +169,7 @@ task:
     val_ratio: 0.1
     use_ratio: 1.0
     dataset_idx: null
-    normalizer_num_workers: 0
+    normalizer_num_workers: 8
 
 # DAgger dataset configuration
 # teleop_dataset_path and hitl_dataset_path should be overridden from launch script

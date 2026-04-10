@@ -6,6 +6,10 @@ run_dir="data/outputs/${now_date}/${now_seconds}"
 mkdir -p "${run_dir}"
 echo "${run_dir}"
 
+# Zarr cache (LMDB) on local SSD to reduce transient read errors
+CACHE_DIR="/mnt/ssd/umi_cache"
+mkdir -p "${CACHE_DIR}"
+
 # Enable full tracebacks and worker crash visibility
 export HYDRA_FULL_ERROR=1
 export PYTHONFAULTHANDLER=1
@@ -41,6 +45,7 @@ accelerate launch --mixed_precision 'no' ../train.py \
 	policy.obs_encoder.model_name='vit_large_patch14_dinov2.lvd142m' \
 	task.dataset.use_ratio=1.0 \
 	task.dataset.val_ratio=0.1 \
+	task.dataset.cache_dir=${CACHE_DIR} \
 	training.gradient_accumulate_every=2 \
 	training.rollout_every=101 \
 	task.dataset.hitl_prob=0.5 \
