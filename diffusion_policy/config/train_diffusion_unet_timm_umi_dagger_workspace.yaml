@@ -105,6 +105,7 @@ training:
   reset_steps_on_finetune: True
   freeze_encoder_on_finetune: False
   freeze_encoder_epochs: 0
+  ddp_find_unused_parameters: null
   enable_fp32_fallback: True
   lr_scheduler: cosine
   lr_warmup_steps: 2000

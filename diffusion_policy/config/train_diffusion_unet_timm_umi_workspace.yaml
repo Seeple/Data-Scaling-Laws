@@ -162,6 +162,7 @@ training:
   seed: 42
   debug: False
   resume: False
+  ddp_find_unused_parameters: null
   enable_fp32_fallback: True
   # optimization
   lr_scheduler: cosine

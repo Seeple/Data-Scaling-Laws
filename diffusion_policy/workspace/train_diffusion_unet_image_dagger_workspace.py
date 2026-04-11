@@ -115,7 +115,15 @@ class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
 
         use_wandb = cfg.logging.get("use_wandb", True)
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        finetune_from = cfg.training.get("finetune_from", None)
+        ddp_find_unused = cfg.training.get("ddp_find_unused_parameters", None)
+        if ddp_find_unused is None:
+            find_unused_parameters = bool(finetune_from)
+        else:
+            find_unused_parameters = bool(ddp_find_unused)
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=find_unused_parameters
+        )
         accelerator = Accelerator(
             log_with='wandb' if use_wandb else None,
             kwargs_handlers=[ddp_kwargs],
@@ -130,7 +138,6 @@ class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
                 init_kwargs={"wandb": wandb_cfg},
             )
 
-        finetune_from = cfg.training.get("finetune_from", None)
         if cfg.training.resume and finetune_from:
             raise ValueError("Cannot set both training.resume and training.finetune_from")
 
