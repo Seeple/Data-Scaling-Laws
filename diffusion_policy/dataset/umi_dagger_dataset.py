@@ -41,6 +41,7 @@ class DaggerMixedUmiDataset(BaseDataset):
         hitl_dataset_path: str,
         dataset_path: Optional[str] = None,  # ignored; kept for Hydra compatibility
         hitl_prob: float = 0.5,
+        hitl_disable_downsample: bool = False,
         normalizer_num_workers: Optional[int] = None,
         cache_dir: Optional[str] = None,
         pose_repr: dict = {},
@@ -59,8 +60,19 @@ class DaggerMixedUmiDataset(BaseDataset):
         self.rng = np.random.default_rng(seed)
         self.normalizer_num_workers = normalizer_num_workers
 
+        def _disable_downsample(meta: dict) -> dict:
+            meta = copy.deepcopy(meta)
+            for key, attr in meta.get("obs", {}).items():
+                if "down_sample_steps" in attr:
+                    attr["down_sample_steps"] = 1
+            if "action" in meta and "down_sample_steps" in meta["action"]:
+                meta["action"]["down_sample_steps"] = 1
+            return meta
+
+        teleop_shape_meta = shape_meta
+        hitl_shape_meta = _disable_downsample(shape_meta) if hitl_disable_downsample else shape_meta
+
         common_kwargs = dict(
-            shape_meta=shape_meta,
             cache_dir=cache_dir,
             pose_repr=pose_repr,
             action_padding=action_padding,
@@ -73,8 +85,16 @@ class DaggerMixedUmiDataset(BaseDataset):
             dataset_idx=dataset_idx,
         )
 
-        self.teleop_dataset = UmiDataset(dataset_path=teleop_dataset_path, **common_kwargs)
-        self.hitl_dataset = UmiDataset(dataset_path=hitl_dataset_path, **common_kwargs)
+        self.teleop_dataset = UmiDataset(
+            shape_meta=teleop_shape_meta,
+            dataset_path=teleop_dataset_path,
+            **common_kwargs,
+        )
+        self.hitl_dataset = UmiDataset(
+            shape_meta=hitl_shape_meta,
+            dataset_path=hitl_dataset_path,
+            **common_kwargs,
+        )
 
         # expose shared attributes for convenience
         self.shape_meta = shape_meta

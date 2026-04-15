@@ -160,6 +160,7 @@ task:
     teleop_dataset_path: ${task.teleop_dataset_path}
     hitl_dataset_path: ${task.hitl_dataset_path}
     hitl_prob: 0.5
+    hitl_disable_downsample: False
     cache_dir: null
     pose_repr: ${task.pose_repr}
     action_padding: False
