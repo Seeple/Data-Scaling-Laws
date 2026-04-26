@@ -238,8 +238,8 @@ class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
             assert cfg.training.checkpoint_every >= cfg.training.wild_sample_every and cfg.training.checkpoint_every % cfg.training.wild_sample_every == 0
             assert cfg.training.num_epochs // cfg.training.wild_sample_every <= 30
         else:
-            # prefer mixed validation for ranking
-            cfg.checkpoint.topk.monitor_key = 'val_mixed_action_mse_error'
+            # prefer HITL validation for ranking
+            cfg.checkpoint.topk.monitor_key = 'val_hitl_action_mse_error'
             assert cfg.training.checkpoint_every >= cfg.training.sample_every and cfg.training.checkpoint_every % cfg.training.sample_every == 0
         cfg.checkpoint.topk.format_str = 'epoch={epoch:04d}-' + cfg.checkpoint.topk.monitor_key + '={' + cfg.checkpoint.topk.monitor_key + ':.5f}.ckpt'
         topk_manager = TopKCheckpointManager(

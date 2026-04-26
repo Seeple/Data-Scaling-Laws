@@ -1,4 +1,4 @@
-task_name="hang_chinese_knot"
+task_name="manage_table"
 logging_time=$(date "+%d-%H.%M.%S")
 now_seconds="${logging_time: -8}"
 now_date=$(date "+%Y.%m.%d")
@@ -11,7 +11,7 @@ ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-${SCRIPT_DIR}/../accelerate_co
 
 # Multi-GPU settings (optional)
 # Example:
-#   GPU_LIST="0,1,2,3" NUM_PROCESSES=4 zsh hang_chinese_knot.sh
+#   GPU_LIST="0,1,2,3" NUM_PROCESSES=4 bash manage_table.sh
 GPU_LIST="${GPU_LIST:-}"
 NUM_PROCESSES="${NUM_PROCESSES:-}"
 if [ -n "${GPU_LIST}" ]; then
@@ -25,7 +25,7 @@ fi
 # Hugging Face cache / endpoint (optional)
 # Example:
 #   HF_ENDPOINT=https://hf-mirror.com HF_HOME=/home/fangyuan/hf_cache \
-#   MODEL_PRETRAINED=false bash hang_chinese_knot.sh
+#   MODEL_PRETRAINED=false bash manage_table.sh
 HF_ENDPOINT="${HF_ENDPOINT:-}"
 HF_HOME="${HF_HOME:-/home/fangyuan/hf_cache}"
 MODEL_PRETRAINED="${MODEL_PRETRAINED:-}"
@@ -65,10 +65,10 @@ export TORCH_DATALOADER_DEBUG=INFO
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_SHOW_CPP_STACKTRACES=1
 
-accelerate launch --main_process_port 29501 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
+accelerate launch --main_process_port 29502 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
   --config-name=train_diffusion_unet_timm_umi_workspace \
   multi_run.run_dir=${run_dir} multi_run.wandb_name_base=${logging_time} hydra.run.dir=${run_dir} hydra.sweep.dir=${run_dir} \
-  task.dataset_path=../data/dataset/${task_name}/teleop_data/hang_chinese_knot_raw_2.zarr.zip \
+  task.dataset_path=../data/dataset/${task_name}/teleop_data/manage_table_raw_4_25.zarr.zip \
   training.num_epochs=200 \
   dataloader.batch_size=32 \
   dataloader.num_workers=8 \

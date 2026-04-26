@@ -1,4 +1,4 @@
-task_name="hang_chinese_knot_dagger_async_lr3e-5"
+task_name="hang_chinese_knot_dagger_lr5e-5_rlpd0.5_downsample6_vrrtc_hitl"
 logging_time=$(date "+%d-%H.%M.%S")
 now_seconds="${logging_time: -8}"
 now_date=$(date "+%Y.%m.%d")
@@ -29,7 +29,7 @@ fi
 
 # Whether disable downsampling for HITL data (set to false by default)
 # Example:
-#   HITL_DISABLE_DOWNSAMPLE=true bash hang_chinese_knot_dagger.sh
+#   HITL_DISABLE_DOWNSAMPLE=true HITL_DOWNSAMPLE_MULTIPLIER=2 bash hang_chinese_knot_dagger.sh
 HF_ENDPOINT="${HF_ENDPOINT:-}"
 HF_HOME="${HF_HOME:-/home/fangyuan/hf_cache}"
 MODEL_PRETRAINED="${MODEL_PRETRAINED:-}"
@@ -37,6 +37,8 @@ HF_OFFLINE="${HF_OFFLINE:-}"
 WANDB_MODE="${WANDB_MODE:-}"
 USE_WANDB="${USE_WANDB:-}"
 HITL_DISABLE_DOWNSAMPLE="${HITL_DISABLE_DOWNSAMPLE:-}"
+HITL_DOWNSAMPLE_MULTIPLIER="${HITL_DOWNSAMPLE_MULTIPLIER:-}"
+HITL_ONLY_TAG="${HITL_ONLY_TAG:-}"
 if [ -n "${HF_ENDPOINT}" ]; then
 	export HF_ENDPOINT
 fi
@@ -61,6 +63,12 @@ fi
 if [ -n "${HITL_DISABLE_DOWNSAMPLE}" ]; then
 	HYDRA_ARGS+=("task.dataset.hitl_disable_downsample=${HITL_DISABLE_DOWNSAMPLE}")
 fi
+if [ -n "${HITL_DOWNSAMPLE_MULTIPLIER}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_downsample_multiplier=${HITL_DOWNSAMPLE_MULTIPLIER}")
+fi
+if [ -n "${HITL_ONLY_TAG}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_only_tag=${HITL_ONLY_TAG}")
+fi
 
 # Zarr cache (LMDB) on local SSD to reduce transient read errors
 CACHE_DIR="/home/fangyuan/ssd/umi_cache"
@@ -73,7 +81,7 @@ export ACCELERATE_LOG_LEVEL=info
 export TORCH_DATALOADER_DEBUG=INFO
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_SHOW_CPP_STACKTRACES=1
-export FINETUNE_CKPT="/home/fangyuan/project/Data-Scaling-Laws/train_scripts/data/ckpts/hang_chinese_knot_raw_teleop_4_12.ckpt"
+export FINETUNE_CKPT="/home/fangyuan/project/Data-Scaling-Laws/train_scripts/data/ckpts/hang_chinese_knot_raw_teleop_4_21.ckpt"
 
 # Optional: set FINETUNE_CKPT=/path/to/checkpoint.ckpt to enable finetuning
 finetune_ckpt="${FINETUNE_CKPT:-}"
@@ -83,19 +91,18 @@ if [ -n "${finetune_ckpt}" ]; then
 fi
 
 # launch training
-# disable mixed precision here for more stable training
-accelerate launch --main_process_port 29503 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
+accelerate launch --main_process_port 29514 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
 	--config-name=train_diffusion_unet_timm_umi_dagger_workspace \
 	multi_run.run_dir=${run_dir} multi_run.wandb_name_base=${logging_time} hydra.run.dir=${run_dir} hydra.sweep.dir=${run_dir} \
-	task.teleop_dataset_path=../data/dataset/hang_chinese_knot/teleop_data/hang_chinese_knot_raw_1.zarr.zip \
-	task.hitl_dataset_path=../data/dataset/hang_chinese_knot/hitl_data/async_hitl/hang_chinese_knot_hitl_2.zarr.zip \
+	task.teleop_dataset_path=../data/dataset/hang_chinese_knot/teleop_data/hang_chinese_knot_raw_2.zarr.zip \
+	task.hitl_dataset_path=../data/dataset/hang_chinese_knot/hitl_data/vr_rtc_hitl/hang_chinese_knot_vrhitl_4_23.zarr.zip \
 	training.num_epochs=200 \
 	dataloader.batch_size=32 \
 	dataloader.num_workers=8 \
 	dataloader.persistent_workers=True \
 	val_dataloader.num_workers=4 \
 	val_dataloader.persistent_workers=True \
-	optimizer.lr=3e-5 \
+	optimizer.lr=5e-5 \
 	training.lr_warmup_steps=500 \
 	logging.name="${logging_time}_${task_name}_repro" \
 	policy.obs_encoder.model_name='vit_large_patch14_dinov2.lvd142m' \

@@ -42,6 +42,9 @@ class DaggerMixedUmiDataset(BaseDataset):
         dataset_path: Optional[str] = None,  # ignored; kept for Hydra compatibility
         hitl_prob: float = 0.5,
         hitl_disable_downsample: bool = False,
+        hitl_downsample_multiplier: float = 3.0,
+        hitl_only_tag: bool = False,
+        hitl_tag_key: str = "hitl_tag",
         normalizer_num_workers: Optional[int] = None,
         cache_dir: Optional[str] = None,
         pose_repr: dict = {},
@@ -59,18 +62,25 @@ class DaggerMixedUmiDataset(BaseDataset):
         self.hitl_prob = hitl_prob
         self.rng = np.random.default_rng(seed)
         self.normalizer_num_workers = normalizer_num_workers
+        self.hitl_only_tag = hitl_only_tag
+        self.hitl_tag_key = hitl_tag_key
 
-        def _disable_downsample(meta: dict) -> dict:
+        def _adjust_downsample(meta: dict, multiplier: float) -> dict:
             meta = copy.deepcopy(meta)
             for key, attr in meta.get("obs", {}).items():
                 if "down_sample_steps" in attr:
-                    attr["down_sample_steps"] = 1
+                    step = float(attr["down_sample_steps"])
+                    attr["down_sample_steps"] = max(1, int(round(step * multiplier)))
             if "action" in meta and "down_sample_steps" in meta["action"]:
-                meta["action"]["down_sample_steps"] = 1
+                step = float(meta["action"]["down_sample_steps"])
+                meta["action"]["down_sample_steps"] = max(1, int(round(step * multiplier)))
             return meta
 
-        teleop_shape_meta = shape_meta
-        hitl_shape_meta = _disable_downsample(shape_meta) if hitl_disable_downsample else shape_meta
+        hitl_shape_meta = (
+            _adjust_downsample(shape_meta, hitl_downsample_multiplier)
+            if hitl_disable_downsample
+            else shape_meta
+        )
 
         common_kwargs = dict(
             cache_dir=cache_dir,
@@ -85,16 +95,10 @@ class DaggerMixedUmiDataset(BaseDataset):
             dataset_idx=dataset_idx,
         )
 
-        self.teleop_dataset = UmiDataset(
-            shape_meta=teleop_shape_meta,
-            dataset_path=teleop_dataset_path,
-            **common_kwargs,
-        )
-        self.hitl_dataset = UmiDataset(
-            shape_meta=hitl_shape_meta,
-            dataset_path=hitl_dataset_path,
-            **common_kwargs,
-        )
+        self.teleop_dataset = UmiDataset(shape_meta=shape_meta, dataset_path=teleop_dataset_path, **common_kwargs)
+        self.hitl_dataset = UmiDataset(shape_meta=hitl_shape_meta, dataset_path=hitl_dataset_path, **common_kwargs)
+        if self.hitl_only_tag:
+            self._apply_hitl_tag_filter(self.hitl_dataset)
 
         # expose shared attributes for convenience
         self.shape_meta = shape_meta
@@ -136,12 +140,31 @@ class DaggerMixedUmiDataset(BaseDataset):
     def get_validation_dataset(self):
         teleop_val = self.teleop_dataset.get_validation_dataset()
         hitl_val = self.hitl_dataset.get_validation_dataset()
+        if self.hitl_only_tag:
+            self._apply_hitl_tag_filter(hitl_val)
         mixed_val = _MixedValDataset(teleop_val, hitl_val, self.hitl_prob)
         return {
             "teleop": teleop_val,
             "hitl": hitl_val,
             "mixed": mixed_val,
         }
+
+    def _apply_hitl_tag_filter(self, dataset: UmiDataset) -> None:
+        if self.hitl_tag_key not in dataset.replay_buffer:
+            raise KeyError(
+                f"hitl_only_tag enabled but '{self.hitl_tag_key}' not found in HITL dataset"
+            )
+        hitl_tag = np.asarray(dataset.replay_buffer[self.hitl_tag_key]).reshape(-1)
+        filtered = []
+        for entry in dataset.sampler.indices:
+            current_idx = entry[0]
+            if hitl_tag[current_idx] == 1:
+                filtered.append(entry)
+        dataset.sampler.indices = filtered
+        if len(dataset.sampler.indices) == 0:
+            raise ValueError(
+                "hitl_only_tag resulted in an empty HITL dataset; check hitl_tag values"
+            )
 
     # ==================== normalizer ====================
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
