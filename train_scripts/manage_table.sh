@@ -32,6 +32,7 @@ MODEL_PRETRAINED="${MODEL_PRETRAINED:-}"
 HF_OFFLINE="${HF_OFFLINE:-}"
 WANDB_MODE="${WANDB_MODE:-}"
 USE_WANDB="${USE_WANDB:-}"
+ONLY_CAMERA_OBS="${ONLY_CAMERA_OBS:-}"
 if [ -n "${HF_ENDPOINT}" ]; then
   export HF_ENDPOINT
 fi
@@ -53,6 +54,9 @@ fi
 if [ -n "${USE_WANDB}" ]; then
   HYDRA_ARGS+=("logging.use_wandb=${USE_WANDB}")
 fi
+if [ -n "${ONLY_CAMERA_OBS}" ]; then
+  HYDRA_ARGS+=("task.ignore_proprioception=${ONLY_CAMERA_OBS}")
+fi
 
 # Zarr cache (LMDB) on local SSD to reduce transient read errors
 CACHE_DIR="/home/fangyuan/ssd/umi_cache"
@@ -65,10 +69,10 @@ export TORCH_DATALOADER_DEBUG=INFO
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_SHOW_CPP_STACKTRACES=1
 
-accelerate launch --main_process_port 29502 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
+accelerate launch --main_process_port 29503 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
   --config-name=train_diffusion_unet_timm_umi_workspace \
   multi_run.run_dir=${run_dir} multi_run.wandb_name_base=${logging_time} hydra.run.dir=${run_dir} hydra.sweep.dir=${run_dir} \
-  task.dataset_path=../data/dataset/${task_name}/teleop_data/manage_table_raw_4_25.zarr.zip \
+  task.dataset_path=../data/dataset/manage_table/teleop_data/manage_table_raw_4_28.zarr.zip \
   training.num_epochs=200 \
   dataloader.batch_size=32 \
   dataloader.num_workers=8 \
