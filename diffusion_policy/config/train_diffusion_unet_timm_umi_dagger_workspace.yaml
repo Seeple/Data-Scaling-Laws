@@ -138,7 +138,7 @@ logging:
 
 checkpoint:
   topk:
-    monitor_key: val_hitl_action_mse_error
+    monitor_key: val_mixed_action_mse_error
     mode: min
     k: 5
     format_str: 'epoch={epoch:04d}-val_mixed_action_mse_error={val_mixed_action_mse_error:.3f}.ckpt'

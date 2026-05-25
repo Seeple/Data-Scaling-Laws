@@ -78,6 +78,12 @@ fi
 CACHE_DIR="/home/fangyuan/ssd/umi_cache"
 mkdir -p "${CACHE_DIR}"
 
+# Temp dir for multiprocessing / shared memory to avoid /tmp space issues
+TMPDIR="${TMPDIR:-/home/fangyuan/ssd/tmp}"
+mkdir -p "${TMPDIR}"
+export TMPDIR TMP TEMP="${TMPDIR}"
+
+
 # Enable full tracebacks and worker crash visibility
 export HYDRA_FULL_ERROR=1
 export PYTHONFAULTHANDLER=1
