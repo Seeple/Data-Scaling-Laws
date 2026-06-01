@@ -45,6 +45,7 @@ class DaggerMixedUmiDataset(BaseDataset):
         hitl_downsample_multiplier: float = 3.0,
         hitl_only_tag: bool = False,
         hitl_tag_key: str = "hitl_tag",
+        action_normalizer_source: str = "teleop",
         normalizer_num_workers: Optional[int] = None,
         cache_dir: Optional[str] = None,
         pose_repr: dict = {},
@@ -64,6 +65,8 @@ class DaggerMixedUmiDataset(BaseDataset):
         self.normalizer_num_workers = normalizer_num_workers
         self.hitl_only_tag = hitl_only_tag
         self.hitl_tag_key = hitl_tag_key
+        assert action_normalizer_source in {"teleop", "mixed"}
+        self.action_normalizer_source = action_normalizer_source
 
         def _adjust_downsample(meta: dict, multiplier: float) -> dict:
             meta = copy.deepcopy(meta)
@@ -169,11 +172,13 @@ class DaggerMixedUmiDataset(BaseDataset):
     # ==================== normalizer ====================
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
         """
-        Compute normalizer over the mixed training distribution.
+        Compute normalizer for DAgger training.
+        - obs/image normalizers: mixed training distribution
+        - action normalizer: configurable source
         """
         normalizer = LinearNormalizer()
 
-        data_cache = {key: list() for key in self.lowdim_keys + ["action"]}
+        data_cache = {key: list() for key in self.lowdim_keys}
         # build a temporary dataloader to iterate once
         num_workers = kwargs.get("num_workers", self.normalizer_num_workers)
         if num_workers is None:
@@ -182,7 +187,6 @@ class DaggerMixedUmiDataset(BaseDataset):
         for batch in tqdm(dataloader, desc="iterating mixed dataset to get normalization"):
             for key in self.lowdim_keys:
                 data_cache[key].append(copy.deepcopy(batch["obs"][key]))
-            data_cache["action"].append(copy.deepcopy(batch["action"]))
 
         for key in data_cache.keys():
             data_cache[key] = np.concatenate(data_cache[key])
@@ -192,25 +196,45 @@ class DaggerMixedUmiDataset(BaseDataset):
                 data_cache[key] = data_cache[key].reshape(B * T, D)
 
         # action
-        assert data_cache["action"].shape[-1] % self.num_robot == 0
-        dim_a = data_cache["action"].shape[-1] // self.num_robot
-        action_normalizers = list()
-        for i in range(self.num_robot):
-            action_normalizers.append(
-                get_range_normalizer_from_stat(array_to_stats(data_cache["action"][..., i * dim_a : i * dim_a + 3]))
-            )  # pos
-            action_normalizers.append(
-                get_identity_normalizer_from_stat(
-                    array_to_stats(data_cache["action"][..., i * dim_a + 3 : (i + 1) * dim_a - 1])
-                )
-            )  # rot
-            action_normalizers.append(
-                get_range_normalizer_from_stat(
-                    array_to_stats(data_cache["action"][..., (i + 1) * dim_a - 1 : (i + 1) * dim_a])
-                )
-            )  # gripper
+        if self.action_normalizer_source == "teleop":
+            # Preferred for DAgger finetuning stability:
+            # keep action scale anchored to offline expert distribution.
+            teleop_normalizer = self.teleop_dataset.get_normalizer()
+            normalizer["action"] = teleop_normalizer["action"]
+        else:
+            # Kept for ablation/backward compatibility:
+            # compute action normalizer from mixed (teleop + HITL) samples.
+            mixed_action_cache = list()
+            action_dataloader = DataLoader(self, batch_size=64, num_workers=num_workers)
+            for batch in tqdm(action_dataloader, desc="iterating mixed dataset to get ACTION normalization"):
+                mixed_action_cache.append(copy.deepcopy(batch["action"]))
+            mixed_action_cache = np.concatenate(mixed_action_cache)
+            assert len(mixed_action_cache.shape) == 3
+            B, T, D = mixed_action_cache.shape
+            if not self.temporally_independent_normalization:
+                mixed_action_cache = mixed_action_cache.reshape(B * T, D)
 
-        normalizer["action"] = concatenate_normalizer(action_normalizers)
+            assert mixed_action_cache.shape[-1] % self.num_robot == 0
+            dim_a = mixed_action_cache.shape[-1] // self.num_robot
+            action_normalizers = list()
+            for i in range(self.num_robot):
+                action_normalizers.append(
+                    get_range_normalizer_from_stat(
+                        array_to_stats(mixed_action_cache[..., i * dim_a : i * dim_a + 3])
+                    )
+                )  # pos
+                action_normalizers.append(
+                    get_identity_normalizer_from_stat(
+                        array_to_stats(mixed_action_cache[..., i * dim_a + 3 : (i + 1) * dim_a - 1])
+                    )
+                )  # rot
+                action_normalizers.append(
+                    get_range_normalizer_from_stat(
+                        array_to_stats(mixed_action_cache[..., (i + 1) * dim_a - 1 : (i + 1) * dim_a])
+                    )
+                )  # gripper
+
+            normalizer["action"] = concatenate_normalizer(action_normalizers)
 
         # obs
         for key in self.lowdim_keys:

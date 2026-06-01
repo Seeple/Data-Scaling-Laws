@@ -164,6 +164,9 @@ task:
     hitl_downsample_multiplier: 2
     hitl_only_tag: False
     hitl_tag_key: hitl_tag
+    # Keep action normalization fixed to offline expert (teleop) distribution by default.
+    # Set to "mixed" for ablation/backward-compatible behavior.
+    action_normalizer_source: teleop
     cache_dir: null
     pose_repr: ${task.pose_repr}
     action_padding: False
