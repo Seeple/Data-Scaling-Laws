@@ -177,6 +177,11 @@ class DaggerMixedUmiDataset(BaseDataset):
         - action normalizer: configurable source
         """
         normalizer = LinearNormalizer()
+        print(
+            "[DaggerMixedUmiDataset] Normalizer config: "
+            f"action_normalizer_source={self.action_normalizer_source} "
+            "(default=teleop/offline)"
+        )
 
         data_cache = {key: list() for key in self.lowdim_keys}
         # build a temporary dataloader to iterate once
@@ -184,7 +189,10 @@ class DaggerMixedUmiDataset(BaseDataset):
         if num_workers is None:
             num_workers = 8
         dataloader = DataLoader(self, batch_size=64, num_workers=num_workers)
-        for batch in tqdm(dataloader, desc="iterating mixed dataset to get normalization"):
+        for batch in tqdm(
+            dataloader,
+            desc="iterating mixed dataset to get OBS normalization",
+        ):
             for key in self.lowdim_keys:
                 data_cache[key].append(copy.deepcopy(batch["obs"][key]))
 
@@ -199,6 +207,10 @@ class DaggerMixedUmiDataset(BaseDataset):
         if self.action_normalizer_source == "teleop":
             # Preferred for DAgger finetuning stability:
             # keep action scale anchored to offline expert distribution.
+            print(
+                "[DaggerMixedUmiDataset] Building ACTION normalizer from "
+                "teleop/offline buffer."
+            )
             teleop_normalizer = self.teleop_dataset.get_normalizer()
             normalizer["action"] = teleop_normalizer["action"]
         else:
@@ -206,7 +218,14 @@ class DaggerMixedUmiDataset(BaseDataset):
             # compute action normalizer from mixed (teleop + HITL) samples.
             mixed_action_cache = list()
             action_dataloader = DataLoader(self, batch_size=64, num_workers=num_workers)
-            for batch in tqdm(action_dataloader, desc="iterating mixed dataset to get ACTION normalization"):
+            print(
+                "[DaggerMixedUmiDataset] Building ACTION normalizer from mixed "
+                "(teleop + HITL) buffer."
+            )
+            for batch in tqdm(
+                action_dataloader,
+                desc="iterating mixed dataset to get ACTION normalization",
+            ):
                 mixed_action_cache.append(copy.deepcopy(batch["action"]))
             mixed_action_cache = np.concatenate(mixed_action_cache)
             assert len(mixed_action_cache.shape) == 3
