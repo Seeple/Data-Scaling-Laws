@@ -184,6 +184,16 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
                 repeats=self.train_diffusion_n_samples, dim=0)
             nactions = torch.repeat_interleave(nactions, 
                 repeats=self.train_diffusion_n_samples, dim=0)
+            if "action_valid_mask" in batch:
+                action_valid_mask = torch.repeat_interleave(
+                    batch["action_valid_mask"],
+                    repeats=self.train_diffusion_n_samples,
+                    dim=0,
+                )
+            else:
+                action_valid_mask = None
+        else:
+            action_valid_mask = batch.get("action_valid_mask", None)
 
         trajectory = nactions
         # Sample noise that we'll add to the images
@@ -221,8 +231,16 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
 
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss.type(loss.dtype)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
+        if action_valid_mask is not None:
+            action_valid_mask = action_valid_mask.to(device=loss.device, dtype=loss.dtype)
+            while action_valid_mask.ndim < loss.ndim:
+                action_valid_mask = action_valid_mask.unsqueeze(-1)
+            loss = loss * action_valid_mask
+            denom = action_valid_mask.expand_as(loss).sum().clamp(min=1.0)
+            loss = loss.sum() / denom
+        else:
+            loss = reduce(loss, 'b ... -> b (...)', 'mean')
+            loss = loss.mean()
 
         return loss
 

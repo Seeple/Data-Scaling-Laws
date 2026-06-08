@@ -45,7 +45,13 @@ class DaggerMixedUmiDataset(BaseDataset):
         hitl_downsample_multiplier: float = 3.0,
         hitl_only_tag: bool = False,
         hitl_tag_key: str = "hitl_tag",
+        hitl_require_full_action_tag: bool = False,
+        hitl_action_mask: bool = False,
+        hitl_skip_rising_edge: bool = False,
+        hitl_skip_rising_edge_steps: int = 5,
+        hitl_treat_segments_as_episodes: bool = False,
         action_normalizer_source: str = "teleop",
+        lowdim_obs_normalizer_source: str = "mixed",
         normalizer_num_workers: Optional[int] = None,
         cache_dir: Optional[str] = None,
         pose_repr: dict = {},
@@ -65,8 +71,15 @@ class DaggerMixedUmiDataset(BaseDataset):
         self.normalizer_num_workers = normalizer_num_workers
         self.hitl_only_tag = hitl_only_tag
         self.hitl_tag_key = hitl_tag_key
+        self.hitl_require_full_action_tag = hitl_require_full_action_tag
+        self.hitl_action_mask = hitl_action_mask
+        self.hitl_skip_rising_edge = hitl_skip_rising_edge
+        self.hitl_skip_rising_edge_steps = int(hitl_skip_rising_edge_steps)
+        self.hitl_treat_segments_as_episodes = hitl_treat_segments_as_episodes
         assert action_normalizer_source in {"teleop", "mixed"}
         self.action_normalizer_source = action_normalizer_source
+        assert lowdim_obs_normalizer_source in {"mixed", "teleop"}
+        self.lowdim_obs_normalizer_source = lowdim_obs_normalizer_source
 
         def _adjust_downsample(meta: dict, multiplier: float) -> dict:
             meta = copy.deepcopy(meta)
@@ -100,7 +113,7 @@ class DaggerMixedUmiDataset(BaseDataset):
 
         self.teleop_dataset = UmiDataset(shape_meta=shape_meta, dataset_path=teleop_dataset_path, **common_kwargs)
         self.hitl_dataset = UmiDataset(shape_meta=hitl_shape_meta, dataset_path=hitl_dataset_path, **common_kwargs)
-        if self.hitl_only_tag:
+        if self._needs_hitl_tag_filter():
             self._apply_hitl_tag_filter(self.hitl_dataset)
 
         # expose shared attributes for convenience
@@ -128,7 +141,14 @@ class DaggerMixedUmiDataset(BaseDataset):
             # Re-index inside chosen dataset to avoid IndexError
             mapped_idx = idx % len(dataset)
             try:
-                return dataset[mapped_idx]
+                sample = dataset[mapped_idx]
+                if self.hitl_action_mask:
+                    sample["action_valid_mask"] = self._get_action_valid_mask(
+                        dataset=dataset,
+                        mapped_idx=mapped_idx,
+                        action_length=sample["action"].shape[0],
+                    )
+                return sample
             except JpegxlError as exc:
                 attempt += 1
                 if attempt > max_retries:
@@ -143,7 +163,7 @@ class DaggerMixedUmiDataset(BaseDataset):
     def get_validation_dataset(self):
         teleop_val = self.teleop_dataset.get_validation_dataset()
         hitl_val = self.hitl_dataset.get_validation_dataset()
-        if self.hitl_only_tag:
+        if self._needs_hitl_tag_filter():
             self._apply_hitl_tag_filter(hitl_val)
         mixed_val = _MixedValDataset(teleop_val, hitl_val, self.hitl_prob)
         return {
@@ -152,56 +172,161 @@ class DaggerMixedUmiDataset(BaseDataset):
             "mixed": mixed_val,
         }
 
-    def _apply_hitl_tag_filter(self, dataset: UmiDataset) -> None:
+    def _needs_hitl_tag_filter(self) -> bool:
+        return (
+            self.hitl_only_tag
+            or self.hitl_require_full_action_tag
+            or self.hitl_skip_rising_edge
+            or self.hitl_treat_segments_as_episodes
+        )
+
+    def _get_hitl_tag(self, dataset: UmiDataset) -> np.ndarray:
         if self.hitl_tag_key not in dataset.replay_buffer:
             raise KeyError(
-                f"hitl_only_tag enabled but '{self.hitl_tag_key}' not found in HITL dataset"
+                f"HITL tag logic enabled but '{self.hitl_tag_key}' not found in HITL dataset"
             )
-        hitl_tag = np.asarray(dataset.replay_buffer[self.hitl_tag_key]).reshape(-1)
+        return np.asarray(dataset.replay_buffer[self.hitl_tag_key]).reshape(-1)
+
+    @staticmethod
+    def _build_hitl_segments(hitl_tag: np.ndarray, episode_ends: np.ndarray):
+        segments_by_episode = []
+        for ep_idx, ep_end in enumerate(episode_ends):
+            start_idx = 0 if ep_idx == 0 else int(episode_ends[ep_idx - 1])
+            end_idx = int(ep_end)
+            segments = []
+            in_segment = False
+            seg_start = start_idx
+            for idx in range(start_idx, end_idx):
+                active = hitl_tag[idx] == 1
+                if active and not in_segment:
+                    in_segment = True
+                    seg_start = idx
+                elif not active and in_segment:
+                    segments.append((seg_start, idx))
+                    in_segment = False
+            if in_segment:
+                segments.append((seg_start, end_idx))
+            segments_by_episode.append(segments)
+        return segments_by_episode
+
+    @staticmethod
+    def _find_segment(current_idx: int, segments):
+        for seg_start, seg_end in segments:
+            if seg_start <= current_idx < seg_end:
+                return seg_start, seg_end
+        return None
+
+    @staticmethod
+    def _future_action_indices(current_idx: int, horizon: int, stride: int) -> np.ndarray:
+        return current_idx + np.arange(horizon, dtype=np.int64) * int(stride)
+
+    def _apply_hitl_tag_filter(self, dataset: UmiDataset) -> None:
+        hitl_tag = self._get_hitl_tag(dataset)
+        episode_ends = np.asarray(dataset.replay_buffer.episode_ends[:], dtype=np.int64)
+        segments_by_episode = self._build_hitl_segments(hitl_tag, episode_ends)
+        action_horizon = dataset.key_horizon["action"]
+        action_stride = int(dataset.key_down_sample_steps["action"])
+
         filtered = []
         for entry in dataset.sampler.indices:
-            current_idx = entry[0]
-            if hitl_tag[current_idx] == 1:
+            current_idx, start_idx, end_idx, before_first_grasp = entry
+            current_idx = int(current_idx)
+            if hitl_tag[current_idx] != 1:
+                continue
+
+            ep_idx = int(np.searchsorted(episode_ends, current_idx, side="right"))
+            segment = self._find_segment(current_idx, segments_by_episode[ep_idx])
+            if segment is None:
+                continue
+            seg_start, seg_end = segment
+
+            if self.hitl_skip_rising_edge:
+                if current_idx < seg_start + self.hitl_skip_rising_edge_steps:
+                    continue
+
+            future_idx = self._future_action_indices(
+                current_idx=current_idx,
+                horizon=action_horizon,
+                stride=action_stride,
+            )
+            if future_idx[-1] >= int(end_idx):
+                continue
+
+            if self.hitl_require_full_action_tag and not np.all(hitl_tag[future_idx] == 1):
+                continue
+
+            if self.hitl_treat_segments_as_episodes:
+                # Make the sampler pad obs history at the segment start and avoid
+                # supervising labels outside the continuous human-control interval.
+                if future_idx[-1] >= seg_end:
+                    continue
+                filtered.append((current_idx, seg_start, seg_end, before_first_grasp))
+            else:
                 filtered.append(entry)
+
         dataset.sampler.indices = filtered
         if len(dataset.sampler.indices) == 0:
             raise ValueError(
-                "hitl_only_tag resulted in an empty HITL dataset; check hitl_tag values"
+                "HITL tag filtering resulted in an empty HITL dataset; check hitl_tag values/settings"
             )
+        print(
+            "[DaggerMixedUmiDataset] HITL sampler after tag filters: "
+            f"{len(dataset.sampler.indices)} samples "
+            f"(hitl_only_tag={self.hitl_only_tag}, "
+            f"hitl_require_full_action_tag={self.hitl_require_full_action_tag}, "
+            f"hitl_skip_rising_edge={self.hitl_skip_rising_edge}, "
+            f"hitl_skip_rising_edge_steps={self.hitl_skip_rising_edge_steps}, "
+            f"hitl_treat_segments_as_episodes={self.hitl_treat_segments_as_episodes})"
+        )
+
+    def _get_action_valid_mask(
+        self,
+        dataset: UmiDataset,
+        mapped_idx: int,
+        action_length: int,
+    ) -> torch.Tensor:
+        if dataset is not self.hitl_dataset:
+            return torch.ones(action_length, dtype=torch.float32)
+
+        hitl_tag = self._get_hitl_tag(dataset)
+        current_idx = int(dataset.sampler.indices[mapped_idx][0])
+        action_stride = int(dataset.key_down_sample_steps["action"])
+        future_idx = self._future_action_indices(
+            current_idx=current_idx,
+            horizon=action_length,
+            stride=action_stride,
+        )
+        mask = np.zeros(action_length, dtype=np.float32)
+        valid = future_idx < len(hitl_tag)
+        mask[valid] = (hitl_tag[future_idx[valid]] == 1).astype(np.float32)
+        return torch.from_numpy(mask)
 
     # ==================== normalizer ====================
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
         """
         Compute normalizer for DAgger training.
-        - obs/image normalizers: mixed training distribution
+        - low-dim obs normalizers: mixed or teleop/offline distribution
         - action normalizer: configurable source
         """
         normalizer = LinearNormalizer()
         print(
             "[DaggerMixedUmiDataset] Normalizer config: "
             f"action_normalizer_source={self.action_normalizer_source} "
-            "(default=teleop/offline)"
+            "(default=teleop/offline), "
+            f"lowdim_obs_normalizer_source={self.lowdim_obs_normalizer_source} "
+            "(default=mixed)"
         )
 
-        data_cache = {key: list() for key in self.lowdim_keys}
-        # build a temporary dataloader to iterate once
         num_workers = kwargs.get("num_workers", self.normalizer_num_workers)
         if num_workers is None:
             num_workers = 8
-        dataloader = DataLoader(self, batch_size=64, num_workers=num_workers)
-        for batch in tqdm(
-            dataloader,
-            desc="iterating mixed dataset to get OBS normalization",
-        ):
-            for key in self.lowdim_keys:
-                data_cache[key].append(copy.deepcopy(batch["obs"][key]))
+        teleop_normalizer = None
 
-        for key in data_cache.keys():
-            data_cache[key] = np.concatenate(data_cache[key])
-            assert len(data_cache[key].shape) == 3
-            B, T, D = data_cache[key].shape
-            if not self.temporally_independent_normalization:
-                data_cache[key] = data_cache[key].reshape(B * T, D)
+        def get_teleop_normalizer():
+            nonlocal teleop_normalizer
+            if teleop_normalizer is None:
+                teleop_normalizer = self.teleop_dataset.get_normalizer()
+            return teleop_normalizer
 
         # action
         if self.action_normalizer_source == "teleop":
@@ -211,8 +336,7 @@ class DaggerMixedUmiDataset(BaseDataset):
                 "[DaggerMixedUmiDataset] Building ACTION normalizer from "
                 "teleop/offline buffer."
             )
-            teleop_normalizer = self.teleop_dataset.get_normalizer()
-            normalizer["action"] = teleop_normalizer["action"]
+            normalizer["action"] = get_teleop_normalizer()["action"]
         else:
             # Kept for ablation/backward compatibility:
             # compute action normalizer from mixed (teleop + HITL) samples.
@@ -256,20 +380,46 @@ class DaggerMixedUmiDataset(BaseDataset):
             normalizer["action"] = concatenate_normalizer(action_normalizers)
 
         # obs
-        for key in self.lowdim_keys:
-            stat = array_to_stats(data_cache[key])
+        if self.lowdim_obs_normalizer_source == "teleop":
+            print(
+                "[DaggerMixedUmiDataset] Building LOW-DIM OBS normalizer from "
+                "teleop/offline buffer."
+            )
+            teleop_norm = get_teleop_normalizer()
+            for key in self.lowdim_keys:
+                normalizer[key] = teleop_norm[key]
+        else:
+            data_cache = {key: list() for key in self.lowdim_keys}
+            # build a temporary dataloader to iterate once
+            dataloader = DataLoader(self, batch_size=64, num_workers=num_workers)
+            for batch in tqdm(
+                dataloader,
+                desc="iterating mixed dataset to get OBS normalization",
+            ):
+                for key in self.lowdim_keys:
+                    data_cache[key].append(copy.deepcopy(batch["obs"][key]))
 
-            if key.endswith("pos") or "pos_wrt" in key:
-                this_normalizer = get_range_normalizer_from_stat(stat)
-            elif key.endswith("pos_abs"):
-                this_normalizer = get_range_normalizer_from_stat(stat)
-            elif key.endswith("rot_axis_angle") or "rot_axis_angle_wrt" in key:
-                this_normalizer = get_identity_normalizer_from_stat(stat)
-            elif key.endswith("gripper_width"):
-                this_normalizer = get_range_normalizer_from_stat(stat)
-            else:
-                raise RuntimeError("unsupported")
-            normalizer[key] = this_normalizer
+            for key in data_cache.keys():
+                data_cache[key] = np.concatenate(data_cache[key])
+                assert len(data_cache[key].shape) == 3
+                B, T, D = data_cache[key].shape
+                if not self.temporally_independent_normalization:
+                    data_cache[key] = data_cache[key].reshape(B * T, D)
+
+            for key in self.lowdim_keys:
+                stat = array_to_stats(data_cache[key])
+
+                if key.endswith("pos") or "pos_wrt" in key:
+                    this_normalizer = get_range_normalizer_from_stat(stat)
+                elif key.endswith("pos_abs"):
+                    this_normalizer = get_range_normalizer_from_stat(stat)
+                elif key.endswith("rot_axis_angle") or "rot_axis_angle_wrt" in key:
+                    this_normalizer = get_identity_normalizer_from_stat(stat)
+                elif key.endswith("gripper_width"):
+                    this_normalizer = get_range_normalizer_from_stat(stat)
+                else:
+                    raise RuntimeError("unsupported")
+                normalizer[key] = this_normalizer
 
         # image
         for key in self.rgb_keys:
