@@ -1,4 +1,4 @@
-task_name="manage_table_lr5e-5_rlpd0.5_vrrtc_hitl_single_pattern_sanity_iter2_check_only_human_downsample6"
+task_name="manage_table_5_20_correct_actionnorm_async_hitl_only_human_downsample6_loss_mask"
 logging_time=$(date "+%d-%H.%M.%S")
 now_seconds="${logging_time: -8}"
 now_date=$(date "+%Y.%m.%d")
@@ -114,7 +114,7 @@ export ACCELERATE_LOG_LEVEL=info
 export TORCH_DATALOADER_DEBUG=INFO
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_SHOW_CPP_STACKTRACES=1
-export FINETUNE_CKPT="/home/fangyuan/project/Data-Scaling-Laws/train_scripts/data/ckpts/manage_table_dagger_w_single_pattern_iter1_only_human_downsample6.ckpt"
+export FINETUNE_CKPT="/home/fangyuan/project/Data-Scaling-Laws/train_scripts/data/ckpts/manage_table_raw_teleop_5_20_w_pro.ckpt"
 
 # Optional: set FINETUNE_CKPT=/path/to/checkpoint.ckpt to enable finetuning
 finetune_ckpt="${FINETUNE_CKPT:-}"
@@ -124,12 +124,12 @@ if [ -n "${finetune_ckpt}" ]; then
 fi
 
 # launch training
-accelerate launch --main_process_port 29501 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
+accelerate launch --main_process_port 29502 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
 	--config-name=train_diffusion_unet_timm_umi_dagger_workspace \
 	multi_run.run_dir=${run_dir} multi_run.wandb_name_base=${logging_time} hydra.run.dir=${run_dir} hydra.sweep.dir=${run_dir} \
-	task.teleop_dataset_path=../data/dataset/manage_table/teleop_data/manage_table_raw_4_28.zarr.zip \
-	task.hitl_dataset_path=../data/dataset/manage_table/hitl_data/vrrtc_hitl/manage_table_vrhitl_single_pattern_iter2.zarr.zip \
-	training.num_epochs=300 \
+	task.teleop_dataset_path=../data/dataset/manage_table/teleop_data/manage_table_raw_5_19.zarr.zip \
+	task.hitl_dataset_path=../data/dataset/manage_table/hitl_data/async_hitl/manage_table_async_hitl_iter1_7_6.zarr.zip \
+	training.num_epochs=400 \
 	dataloader.batch_size=64 \
 	dataloader.num_workers=16 \
 	dataloader.persistent_workers=True \
