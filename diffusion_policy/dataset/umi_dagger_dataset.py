@@ -27,11 +27,13 @@ except Exception:  # pragma: no cover - fallback if imagecodecs internals change
 
 class DaggerMixedUmiDataset(BaseDataset):
     """
-    Offline DAgger mixture of two UMI zarr datasets (teleop + HITL/DAgger corrections).
+    Offline DAgger mixture of one teleop buffer and one or more HITL buffers.
 
-    Sampling: per-sample Bernoulli with probability `hitl_prob` of drawing from HITL dataset.
-    Validation: returns a dict with split-specific datasets (teleop / hitl / mixed).
-    Normalizer: computed over the mixed training distribution.
+    Sampling: per-sample categorical draw from `rlpd_ratio` if provided. Otherwise,
+    fall back to the historical two-buffer Bernoulli `hitl_prob` behavior.
+    Validation: returns split-specific datasets plus a weighted mixed validation set.
+    Normalizer: action stats can stay fixed to teleop/offline, while low-dim obs
+    stats can come from the weighted mixed training distribution.
     """
 
     def __init__(
@@ -40,6 +42,8 @@ class DaggerMixedUmiDataset(BaseDataset):
         teleop_dataset_path: str,
         hitl_dataset_path: str,
         dataset_path: Optional[str] = None,  # ignored; kept for Hydra compatibility
+        online_dataset_paths: Optional[object] = None,
+        rlpd_ratio: Optional[object] = None,
         hitl_prob: float = 0.5,
         hitl_disable_downsample: bool = False,
         hitl_downsample_multiplier: float = 3.0,
@@ -80,6 +84,9 @@ class DaggerMixedUmiDataset(BaseDataset):
         self.action_normalizer_source = action_normalizer_source
         assert lowdim_obs_normalizer_source in {"mixed", "teleop"}
         self.lowdim_obs_normalizer_source = lowdim_obs_normalizer_source
+        self.online_dataset_paths = self._coerce_list(online_dataset_paths)
+        if len(self.online_dataset_paths) == 0:
+            self.online_dataset_paths = [hitl_dataset_path]
 
         def _adjust_downsample(meta: dict, multiplier: float) -> dict:
             meta = copy.deepcopy(meta)
@@ -112,9 +119,34 @@ class DaggerMixedUmiDataset(BaseDataset):
         )
 
         self.teleop_dataset = UmiDataset(shape_meta=shape_meta, dataset_path=teleop_dataset_path, **common_kwargs)
-        self.hitl_dataset = UmiDataset(shape_meta=hitl_shape_meta, dataset_path=hitl_dataset_path, **common_kwargs)
+        self.online_datasets = [
+            UmiDataset(shape_meta=hitl_shape_meta, dataset_path=path, **common_kwargs)
+            for path in self.online_dataset_paths
+        ]
+        # Backward-compatible alias for code/tests that still expect one HITL dataset.
+        self.hitl_dataset = self.online_datasets[0]
         if self._needs_hitl_tag_filter():
-            self._apply_hitl_tag_filter(self.hitl_dataset)
+            for online_idx, dataset in enumerate(self.online_datasets):
+                self._apply_hitl_tag_filter(dataset, dataset_name=f"online_{online_idx}")
+
+        self.datasets = [self.teleop_dataset] + self.online_datasets
+        self.dataset_names = ["teleop"] + [
+            "hitl" if i == 0 else f"hitl_{i}"
+            for i in range(len(self.online_datasets))
+        ]
+        self.dataset_is_online = [False] + [True] * len(self.online_datasets)
+        self.dataset_weights = self._resolve_sampling_weights(rlpd_ratio)
+        print(
+            "[DaggerMixedUmiDataset] Sampling buffers: "
+            + ", ".join(
+                f"{name}=weight:{weight:.6f},len:{len(dataset)}"
+                for name, weight, dataset in zip(
+                    self.dataset_names,
+                    self.dataset_weights,
+                    self.datasets,
+                )
+            )
+        )
 
         # expose shared attributes for convenience
         self.shape_meta = shape_meta
@@ -126,18 +158,84 @@ class DaggerMixedUmiDataset(BaseDataset):
         self.num_robot = self.teleop_dataset.num_robot
         self.temporally_independent_normalization = temporally_independent_normalization
 
+    @staticmethod
+    def _coerce_list(value) -> list:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "" or value.lower() in {"none", "null"}:
+                return []
+            if value.startswith("[") and value.endswith("]"):
+                value = value[1:-1]
+            return [
+                item.strip().strip("'\"")
+                for item in value.split(",")
+                if item.strip()
+            ]
+        return [
+            item
+            for item in list(value)
+            if item is not None and str(item).strip().lower() not in {"", "none", "null"}
+        ]
+
+    @staticmethod
+    def _coerce_float_list(value) -> Optional[list]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "" or value.lower() in {"none", "null"}:
+                return None
+            if value.startswith("[") and value.endswith("]"):
+                value = value[1:-1]
+            return [
+                float(item.strip())
+                for item in value.split(",")
+                if item.strip()
+            ]
+        return [float(item) for item in list(value)]
+
+    def _resolve_sampling_weights(self, rlpd_ratio) -> np.ndarray:
+        weights = self._coerce_float_list(rlpd_ratio)
+        if weights is None:
+            # Historical two-buffer behavior: offline with 1-hitl_prob, first
+            # online/HITL buffer with hitl_prob. Additional online buffers must
+            # opt into explicit rlpd_ratio to avoid surprising defaults.
+            if len(self.datasets) != 2:
+                raise ValueError(
+                    "Multiple online buffers require explicit rlpd_ratio with "
+                    "one weight for teleop/offline plus one per online buffer."
+                )
+            weights = [1.0 - self.hitl_prob, self.hitl_prob]
+
+        if len(weights) != len(self.datasets):
+            raise ValueError(
+                "rlpd_ratio length mismatch: expected "
+                f"{len(self.datasets)} weights for {self.dataset_names}, got {len(weights)}"
+            )
+        weights = np.asarray(weights, dtype=np.float64)
+        if np.any(weights < 0):
+            raise ValueError(f"rlpd_ratio must be non-negative, got {weights.tolist()}")
+        total = float(weights.sum())
+        if total <= 0:
+            raise ValueError(f"rlpd_ratio must have positive sum, got {weights.tolist()}")
+        return weights / total
+
     def __len__(self) -> int:
-        # Use the larger dataset length as one epoch length.
-        return max(len(self.teleop_dataset), len(self.hitl_dataset))
+        # Use the largest buffer length as one epoch length; smaller buffers are
+        # re-indexed cyclically after categorical sampling, matching old behavior.
+        return max(len(dataset) for dataset in self.datasets)
 
     def _sample_dataset(self):
-        return self.hitl_dataset if self.rng.random() < self.hitl_prob else self.teleop_dataset
+        dataset_idx = int(self.rng.choice(len(self.datasets), p=self.dataset_weights))
+        return dataset_idx, self.datasets[dataset_idx]
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         max_retries = 5
         attempt = 0
         while True:
-            dataset = self._sample_dataset()
+            dataset_idx, dataset = self._sample_dataset()
             # Re-index inside chosen dataset to avoid IndexError
             mapped_idx = idx % len(dataset)
             try:
@@ -147,6 +245,7 @@ class DaggerMixedUmiDataset(BaseDataset):
                         dataset=dataset,
                         mapped_idx=mapped_idx,
                         action_length=sample["action"].shape[0],
+                        is_online=self.dataset_is_online[dataset_idx],
                     )
                 return sample
             except JpegxlError as exc:
@@ -162,15 +261,29 @@ class DaggerMixedUmiDataset(BaseDataset):
     # ==================== validation datasets ====================
     def get_validation_dataset(self):
         teleop_val = self.teleop_dataset.get_validation_dataset()
-        hitl_val = self.hitl_dataset.get_validation_dataset()
+        online_vals = [
+            dataset.get_validation_dataset()
+            for dataset in self.online_datasets
+        ]
         if self._needs_hitl_tag_filter():
-            self._apply_hitl_tag_filter(hitl_val)
-        mixed_val = _MixedValDataset(teleop_val, hitl_val, self.hitl_prob)
-        return {
+            for online_idx, val_dataset in enumerate(online_vals):
+                self._apply_hitl_tag_filter(
+                    val_dataset,
+                    dataset_name=f"val_online_{online_idx}",
+                )
+        mixed_val = _MixedValDataset(
+            datasets=[teleop_val] + online_vals,
+            weights=self.dataset_weights,
+        )
+        result = {
             "teleop": teleop_val,
-            "hitl": hitl_val,
             "mixed": mixed_val,
         }
+        if len(online_vals) > 0:
+            result["hitl"] = online_vals[0]
+        for online_idx, val_dataset in enumerate(online_vals[1:], start=1):
+            result[f"hitl_{online_idx}"] = val_dataset
+        return result
 
     def _needs_hitl_tag_filter(self) -> bool:
         return (
@@ -220,7 +333,7 @@ class DaggerMixedUmiDataset(BaseDataset):
     def _future_action_indices(current_idx: int, horizon: int, stride: int) -> np.ndarray:
         return current_idx + np.arange(horizon, dtype=np.int64) * int(stride)
 
-    def _apply_hitl_tag_filter(self, dataset: UmiDataset) -> None:
+    def _apply_hitl_tag_filter(self, dataset: UmiDataset, dataset_name: str = "hitl") -> None:
         hitl_tag = self._get_hitl_tag(dataset)
         episode_ends = np.asarray(dataset.replay_buffer.episode_ends[:], dtype=np.int64)
         segments_by_episode = self._build_hitl_segments(hitl_tag, episode_ends)
@@ -270,7 +383,7 @@ class DaggerMixedUmiDataset(BaseDataset):
                 "HITL tag filtering resulted in an empty HITL dataset; check hitl_tag values/settings"
             )
         print(
-            "[DaggerMixedUmiDataset] HITL sampler after tag filters: "
+            f"[DaggerMixedUmiDataset:{dataset_name}] HITL sampler after tag filters: "
             f"{len(dataset.sampler.indices)} samples "
             f"(hitl_only_tag={self.hitl_only_tag}, "
             f"hitl_require_full_action_tag={self.hitl_require_full_action_tag}, "
@@ -284,8 +397,9 @@ class DaggerMixedUmiDataset(BaseDataset):
         dataset: UmiDataset,
         mapped_idx: int,
         action_length: int,
+        is_online: bool,
     ) -> torch.Tensor:
-        if dataset is not self.hitl_dataset:
+        if not is_online:
             return torch.ones(action_length, dtype=torch.float32)
 
         hitl_tag = self._get_hitl_tag(dataset)
@@ -428,18 +542,19 @@ class DaggerMixedUmiDataset(BaseDataset):
 
 
 class _MixedValDataset(BaseDataset):
-    """Validation-time mixture dataset with the same Bernoulli sampling."""
+    """Validation-time weighted mixture dataset."""
 
-    def __init__(self, teleop_val: BaseDataset, hitl_val: BaseDataset, hitl_prob: float):
-        self.teleop_val = teleop_val
-        self.hitl_val = hitl_val
-        self.hitl_prob = hitl_prob
+    def __init__(self, datasets, weights):
+        self.datasets = list(datasets)
+        self.weights = np.asarray(weights, dtype=np.float64)
+        self.weights = self.weights / self.weights.sum()
         self.rng = np.random.default_rng(0)
 
     def __len__(self):
-        return max(len(self.teleop_val), len(self.hitl_val))
+        return max(len(dataset) for dataset in self.datasets)
 
     def __getitem__(self, idx: int):
-        dataset = self.hitl_val if self.rng.random() < self.hitl_prob else self.teleop_val
+        dataset_idx = int(self.rng.choice(len(self.datasets), p=self.weights))
+        dataset = self.datasets[dataset_idx]
         mapped_idx = idx % len(dataset)
         return dataset[mapped_idx]

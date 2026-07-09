@@ -154,11 +154,18 @@ multi_run:
 task:
   teleop_dataset_path: ${oc.env:TELEOP_DATASET_PATH,${task.dataset_path}}
   hitl_dataset_path: ${oc.env:HITL_DATASET_PATH,${task.dataset_path}}
+  # Optional multi-online-buffer mode. When null, hitl_dataset_path is used as
+  # the single online buffer for backward compatibility.
+  online_dataset_paths: null
   dataset:
     _target_: diffusion_policy.dataset.umi_dagger_dataset.DaggerMixedUmiDataset
     shape_meta: ${task.shape_meta}
     teleop_dataset_path: ${task.teleop_dataset_path}
     hitl_dataset_path: ${task.hitl_dataset_path}
+    online_dataset_paths: ${task.online_dataset_paths}
+    # Sampling weights: [offline, online_0, online_1, ...]. If null, falls back
+    # to [1-hitl_prob, hitl_prob] for the historical two-buffer setting.
+    rlpd_ratio: null
     hitl_prob: 0.5
     hitl_disable_downsample: False
     hitl_downsample_multiplier: 2
@@ -188,7 +195,8 @@ task:
 
 # DAgger dataset configuration
 # teleop_dataset_path and hitl_dataset_path should be overridden from launch script
-# hitl_prob = probability of sampling from HITL per sample
+# rlpd_ratio = sampling weights [offline, online_0, online_1, ...]
+# hitl_prob is kept only for historical two-buffer fallback when rlpd_ratio is null
 # val_ratio controls the split inside each dataset
 # use_ratio lets you downsample both datasets identically
 

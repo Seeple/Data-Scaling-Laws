@@ -40,6 +40,14 @@ ONLY_CAMERA_OBS="${ONLY_CAMERA_OBS:-}"
 HITL_DISABLE_DOWNSAMPLE="${HITL_DISABLE_DOWNSAMPLE:-}"
 HITL_DOWNSAMPLE_MULTIPLIER="${HITL_DOWNSAMPLE_MULTIPLIER:-}"
 HITL_ONLY_TAG="${HITL_ONLY_TAG:-}"
+HITL_REQUIRE_FULL_ACTION_TAG="${HITL_REQUIRE_FULL_ACTION_TAG:-}"
+HITL_ACTION_MASK="${HITL_ACTION_MASK:-}"
+HITL_SKIP_RISING_EDGE="${HITL_SKIP_RISING_EDGE:-}"
+HITL_SKIP_RISING_EDGE_STEPS="${HITL_SKIP_RISING_EDGE_STEPS:-}"
+HITL_TREAT_SEGMENTS_AS_EPISODES="${HITL_TREAT_SEGMENTS_AS_EPISODES:-}"
+LOWDIM_OBS_NORMALIZER_SOURCE="${LOWDIM_OBS_NORMALIZER_SOURCE:-}"
+ONLINE_DATASET_PATHS="${ONLINE_DATASET_PATHS:-}"
+RLPD_RATIO="${RLPD_RATIO:-[0.5,0.5]}"
 if [ -n "${HF_ENDPOINT}" ]; then
 	export HF_ENDPOINT
 fi
@@ -69,6 +77,40 @@ if [ -n "${HITL_DOWNSAMPLE_MULTIPLIER}" ]; then
 fi
 if [ -n "${HITL_ONLY_TAG}" ]; then
 	HYDRA_ARGS+=("task.dataset.hitl_only_tag=${HITL_ONLY_TAG}")
+fi
+if [ -n "${HITL_REQUIRE_FULL_ACTION_TAG}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_require_full_action_tag=${HITL_REQUIRE_FULL_ACTION_TAG}")
+fi
+if [ -n "${HITL_ACTION_MASK}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_action_mask=${HITL_ACTION_MASK}")
+fi
+if [ -n "${HITL_SKIP_RISING_EDGE}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_skip_rising_edge=${HITL_SKIP_RISING_EDGE}")
+fi
+if [ -n "${HITL_SKIP_RISING_EDGE_STEPS}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_skip_rising_edge_steps=${HITL_SKIP_RISING_EDGE_STEPS}")
+fi
+if [ -n "${HITL_TREAT_SEGMENTS_AS_EPISODES}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_treat_segments_as_episodes=${HITL_TREAT_SEGMENTS_AS_EPISODES}")
+fi
+if [ -n "${LOWDIM_OBS_NORMALIZER_SOURCE}" ]; then
+	HYDRA_ARGS+=("task.dataset.lowdim_obs_normalizer_source=${LOWDIM_OBS_NORMALIZER_SOURCE}")
+fi
+if [ -n "${ONLINE_DATASET_PATHS}" ]; then
+	ONLINE_DATASET_PATHS_ARG="${ONLINE_DATASET_PATHS}"
+	case "${ONLINE_DATASET_PATHS_ARG}" in
+		\[*\]) ;;
+		*) ONLINE_DATASET_PATHS_ARG="[${ONLINE_DATASET_PATHS_ARG}]" ;;
+	esac
+	HYDRA_ARGS+=("task.online_dataset_paths=${ONLINE_DATASET_PATHS_ARG}")
+fi
+if [ -n "${RLPD_RATIO}" ]; then
+	RLPD_RATIO_ARG="${RLPD_RATIO}"
+	case "${RLPD_RATIO_ARG}" in
+		\[*\]) ;;
+		*) RLPD_RATIO_ARG="[${RLPD_RATIO_ARG}]" ;;
+	esac
+	HYDRA_ARGS+=("task.dataset.rlpd_ratio=${RLPD_RATIO_ARG}")
 fi
 if [ -n "${ONLY_CAMERA_OBS}" ]; then
 	HYDRA_ARGS+=("task.ignore_proprioception=${ONLY_CAMERA_OBS}")
@@ -122,7 +164,6 @@ accelerate launch --main_process_port 29514 --config_file "${ACCELERATE_CONFIG_F
 	task.dataset.cache_dir=${CACHE_DIR} \
 	training.gradient_accumulate_every=1 \
 	training.rollout_every=1000 \
-	task.dataset.hitl_prob=0.5 \
 	logging.use_wandb=True \
 	training.freeze_encoder_on_finetune=True \
 	training.freeze_encoder_epochs=3 \
