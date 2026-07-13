@@ -4,42 +4,42 @@ channels:
   - nvidia
   - conda-forge
 dependencies:
-  - python=3.9
-  - pip=22.1
+  - python=3.9.18
+  - pip=22.1.2
   - pytorch=2.1.0
   - pytorch-cuda=12.1
   - torchvision=0.16.0
   - numpy=1.24.4
   - scipy=1.11.4
-  - numba=0.57
+  - numba=0.57.1
   - pandas=2.1.4
   - py-opencv=4.7
-  - ipykernel=6.23
-  - matplotlib=3.7
-  - av=10.0
-  - k3d=2.15
-  - pyyaml=6.0
-  - tqdm=4.65
-  - zarr=2.16
-  - numcodecs=0.11
+  - ipykernel=6.23.3
+  - matplotlib=3.7.3
+  - av=10.0.0
+  - k3d=2.15.3
+  - pyyaml=6.0.2
+  - tqdm=4.65.2
+  - zarr=2.16.1
+  - numcodecs=0.11.0
   - hydra-core=1.2.0
   - wandb=0.15.8
   - dill=0.3.7
   - einops=0.6.1
   - diffusers=0.18.2
-  - scikit-video=1.1
+  - scikit-video=1.1.11
   - gym=0.21.0
   # trick to avoid cpu affinity issue described in https://github.com/pytorch/pytorch/issues/99625
-  - llvm-openmp=14
-  - python-lmdb=1.4
+  - llvm-openmp=14.0.6
+  - python-lmdb=1.4.1
   - timm=0.9.10
-  - scikit-fda=0.9
-  - cython=0.29
+  - scikit-fda=0.9.1
+  - cython=0.29.37
   - accelerate=0.24.1
-  - boto3=1.33
-  - exiftool=12
-  - aiohttp=3.9
-  - aiofiles=23.2
+  - boto3=1.33.13
+  - exiftool=12.76
+  - aiohttp=3.9.5
+  - aiofiles=23.2.1
   - pip:
     - peft==0.11.1
     - ray[default]==2.8.0
@@ -59,9 +59,12 @@ dependencies:
     # implicitly depend on conda package exiftool
     - PyExifTool==0.5
     - transformers==4.36.0
-    - huggingface_hub==0.19.4
+    # Compatibility pins recovered from the working umi environment. Keep
+    # these together to prevent pip from selecting newer incompatible releases.
+    - huggingface-hub==0.20.3
     - tokenizers==0.15.2
+    - protobuf==4.25.3
+    - pydantic==1.10.26
     - urllib3==1.26.18
     - google-api-core==2.11.0
-
 
