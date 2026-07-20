@@ -169,10 +169,23 @@ task:
     hitl_prob: 0.5
     hitl_disable_downsample: False
     hitl_downsample_multiplier: 2
+    # Optional split multipliers for HITL observation/action strides. Disabled
+    # by default so legacy hitl_downsample_multiplier behavior is unchanged.
+    hitl_separate_downsample_multipliers: False
+    hitl_obs_downsample_multiplier: 1
+    hitl_action_downsample_multiplier: 1
     hitl_only_tag: False
     hitl_tag_key: hitl_tag
     hitl_require_full_action_tag: False
     hitl_action_mask: False
+    # Make an online action mask a single valid prefix (1...1,0...0).
+    hitl_contiguous_action_mask: False
+    # Replace the invalid action suffix with the last valid human action. The
+    # suffix remains masked out of the loss; this only changes diffusion input.
+    hitl_invalid_tail_padding: False
+    # Keep only HITL anchors with at least K continuous valid action positions.
+    hitl_min_valid_steps_enabled: False
+    hitl_min_valid_steps: 5
     hitl_skip_rising_edge: False
     hitl_skip_rising_edge_steps: 5
     hitl_treat_segments_as_episodes: False
