@@ -27,9 +27,29 @@ fi
 #   HF_ENDPOINT=https://hf-mirror.com HF_HOME=/home/fangyuan/hf_cache \
 #   MODEL_PRETRAINED=false bash manage_table_dagger.sh
 
-# Whether disable downsampling for HITL data (set to false by default)
-# Example:
-#   HITL_DISABLE_DOWNSAMPLE=true HITL_DOWNSAMPLE_MULTIPLIER=2 bash manage_table_dagger.sh
+# HITL ablation switches (all new features are opt-in).
+#
+# Contiguous-prefix mask:
+#   HITL_ONLY_TAG=true HITL_ACTION_MASK=true \
+#   HITL_CONTIGUOUS_ACTION_MASK=true bash manage_table_dagger.sh
+#
+# Invalid-tail padding (also requires the contiguous-prefix mask):
+#   HITL_ONLY_TAG=true HITL_ACTION_MASK=true \
+#   HITL_CONTIGUOUS_ACTION_MASK=true HITL_INVALID_TAIL_PADDING=true \
+#   bash manage_table_dagger.sh
+#
+# Require at least five continuous human action positions per HITL anchor:
+#   HITL_ONLY_TAG=true HITL_ACTION_MASK=true \
+#   HITL_CONTIGUOUS_ACTION_MASK=true HITL_MIN_VALID_STEPS_ENABLED=true \
+#   HITL_MIN_VALID_STEPS=5 bash manage_table_dagger.sh
+#
+# Separate HITL observation/action stride multipliers. The historical
+# HITL_DISABLE_DOWNSAMPLE gate must remain true; this example keeps obs at
+# stride 3 (x1) while changing action to stride 6 (x2):
+#   HITL_DISABLE_DOWNSAMPLE=true \
+#   HITL_SEPARATE_DOWNSAMPLE_MULTIPLIERS=true \
+#   HITL_OBS_DOWNSAMPLE_MULTIPLIER=1 \
+#   HITL_ACTION_DOWNSAMPLE_MULTIPLIER=2 bash manage_table_dagger.sh
 HF_ENDPOINT="${HF_ENDPOINT:-}"
 HF_HOME="${HF_HOME:-/home/fangyuan/hf_cache}"
 MODEL_PRETRAINED="${MODEL_PRETRAINED:-}"
@@ -39,9 +59,16 @@ USE_WANDB="${USE_WANDB:-}"
 ONLY_CAMERA_OBS="${ONLY_CAMERA_OBS:-}"
 HITL_DISABLE_DOWNSAMPLE="${HITL_DISABLE_DOWNSAMPLE:-}"
 HITL_DOWNSAMPLE_MULTIPLIER="${HITL_DOWNSAMPLE_MULTIPLIER:-}"
+HITL_SEPARATE_DOWNSAMPLE_MULTIPLIERS="${HITL_SEPARATE_DOWNSAMPLE_MULTIPLIERS:-}"
+HITL_OBS_DOWNSAMPLE_MULTIPLIER="${HITL_OBS_DOWNSAMPLE_MULTIPLIER:-}"
+HITL_ACTION_DOWNSAMPLE_MULTIPLIER="${HITL_ACTION_DOWNSAMPLE_MULTIPLIER:-}"
 HITL_ONLY_TAG="${HITL_ONLY_TAG:-}"
 HITL_REQUIRE_FULL_ACTION_TAG="${HITL_REQUIRE_FULL_ACTION_TAG:-}"
 HITL_ACTION_MASK="${HITL_ACTION_MASK:-}"
+HITL_CONTIGUOUS_ACTION_MASK="${HITL_CONTIGUOUS_ACTION_MASK:-}"
+HITL_INVALID_TAIL_PADDING="${HITL_INVALID_TAIL_PADDING:-}"
+HITL_MIN_VALID_STEPS_ENABLED="${HITL_MIN_VALID_STEPS_ENABLED:-}"
+HITL_MIN_VALID_STEPS="${HITL_MIN_VALID_STEPS:-}"
 HITL_SKIP_RISING_EDGE="${HITL_SKIP_RISING_EDGE:-}"
 HITL_SKIP_RISING_EDGE_STEPS="${HITL_SKIP_RISING_EDGE_STEPS:-}"
 HITL_TREAT_SEGMENTS_AS_EPISODES="${HITL_TREAT_SEGMENTS_AS_EPISODES:-}"
@@ -75,6 +102,15 @@ fi
 if [ -n "${HITL_DOWNSAMPLE_MULTIPLIER}" ]; then
 	HYDRA_ARGS+=("task.dataset.hitl_downsample_multiplier=${HITL_DOWNSAMPLE_MULTIPLIER}")
 fi
+if [ -n "${HITL_SEPARATE_DOWNSAMPLE_MULTIPLIERS}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_separate_downsample_multipliers=${HITL_SEPARATE_DOWNSAMPLE_MULTIPLIERS}")
+fi
+if [ -n "${HITL_OBS_DOWNSAMPLE_MULTIPLIER}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_obs_downsample_multiplier=${HITL_OBS_DOWNSAMPLE_MULTIPLIER}")
+fi
+if [ -n "${HITL_ACTION_DOWNSAMPLE_MULTIPLIER}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_action_downsample_multiplier=${HITL_ACTION_DOWNSAMPLE_MULTIPLIER}")
+fi
 if [ -n "${HITL_ONLY_TAG}" ]; then
 	HYDRA_ARGS+=("task.dataset.hitl_only_tag=${HITL_ONLY_TAG}")
 fi
@@ -83,6 +119,18 @@ if [ -n "${HITL_REQUIRE_FULL_ACTION_TAG}" ]; then
 fi
 if [ -n "${HITL_ACTION_MASK}" ]; then
 	HYDRA_ARGS+=("task.dataset.hitl_action_mask=${HITL_ACTION_MASK}")
+fi
+if [ -n "${HITL_CONTIGUOUS_ACTION_MASK}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_contiguous_action_mask=${HITL_CONTIGUOUS_ACTION_MASK}")
+fi
+if [ -n "${HITL_INVALID_TAIL_PADDING}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_invalid_tail_padding=${HITL_INVALID_TAIL_PADDING}")
+fi
+if [ -n "${HITL_MIN_VALID_STEPS_ENABLED}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_min_valid_steps_enabled=${HITL_MIN_VALID_STEPS_ENABLED}")
+fi
+if [ -n "${HITL_MIN_VALID_STEPS}" ]; then
+	HYDRA_ARGS+=("task.dataset.hitl_min_valid_steps=${HITL_MIN_VALID_STEPS}")
 fi
 if [ -n "${HITL_SKIP_RISING_EDGE}" ]; then
 	HYDRA_ARGS+=("task.dataset.hitl_skip_rising_edge=${HITL_SKIP_RISING_EDGE}")

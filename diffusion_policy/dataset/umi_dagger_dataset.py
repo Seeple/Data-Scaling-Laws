@@ -47,10 +47,17 @@ class DaggerMixedUmiDataset(BaseDataset):
         hitl_prob: float = 0.5,
         hitl_disable_downsample: bool = False,
         hitl_downsample_multiplier: float = 3.0,
+        hitl_separate_downsample_multipliers: bool = False,
+        hitl_obs_downsample_multiplier: float = 1.0,
+        hitl_action_downsample_multiplier: float = 1.0,
         hitl_only_tag: bool = False,
         hitl_tag_key: str = "hitl_tag",
         hitl_require_full_action_tag: bool = False,
         hitl_action_mask: bool = False,
+        hitl_contiguous_action_mask: bool = False,
+        hitl_invalid_tail_padding: bool = False,
+        hitl_min_valid_steps_enabled: bool = False,
+        hitl_min_valid_steps: int = 5,
         hitl_skip_rising_edge: bool = False,
         hitl_skip_rising_edge_steps: int = 5,
         hitl_treat_segments_as_episodes: bool = False,
@@ -77,6 +84,10 @@ class DaggerMixedUmiDataset(BaseDataset):
         self.hitl_tag_key = hitl_tag_key
         self.hitl_require_full_action_tag = hitl_require_full_action_tag
         self.hitl_action_mask = hitl_action_mask
+        self.hitl_contiguous_action_mask = bool(hitl_contiguous_action_mask)
+        self.hitl_invalid_tail_padding = bool(hitl_invalid_tail_padding)
+        self.hitl_min_valid_steps_enabled = bool(hitl_min_valid_steps_enabled)
+        self.hitl_min_valid_steps = int(hitl_min_valid_steps)
         self.hitl_skip_rising_edge = hitl_skip_rising_edge
         self.hitl_skip_rising_edge_steps = int(hitl_skip_rising_edge_steps)
         self.hitl_treat_segments_as_episodes = hitl_treat_segments_as_episodes
@@ -88,19 +99,33 @@ class DaggerMixedUmiDataset(BaseDataset):
         if len(self.online_dataset_paths) == 0:
             self.online_dataset_paths = [hitl_dataset_path]
 
-        def _adjust_downsample(meta: dict, multiplier: float) -> dict:
-            meta = copy.deepcopy(meta)
-            for key, attr in meta.get("obs", {}).items():
-                if "down_sample_steps" in attr:
-                    step = float(attr["down_sample_steps"])
-                    attr["down_sample_steps"] = max(1, int(round(step * multiplier)))
-            if "action" in meta and "down_sample_steps" in meta["action"]:
-                step = float(meta["action"]["down_sample_steps"])
-                meta["action"]["down_sample_steps"] = max(1, int(round(step * multiplier)))
-            return meta
+        if self.hitl_contiguous_action_mask and not self.hitl_action_mask:
+            raise ValueError(
+                "hitl_contiguous_action_mask requires hitl_action_mask=true"
+            )
+        if self.hitl_invalid_tail_padding and not self.hitl_contiguous_action_mask:
+            raise ValueError(
+                "hitl_invalid_tail_padding requires "
+                "hitl_contiguous_action_mask=true"
+            )
+        if self.hitl_min_valid_steps_enabled and self.hitl_min_valid_steps < 1:
+            raise ValueError("hitl_min_valid_steps must be at least 1")
+
+        if hitl_separate_downsample_multipliers:
+            obs_multiplier = float(hitl_obs_downsample_multiplier)
+            action_multiplier = float(hitl_action_downsample_multiplier)
+        else:
+            # Preserve the historical shared-multiplier behavior unless the new
+            # feature switch is explicitly enabled.
+            obs_multiplier = float(hitl_downsample_multiplier)
+            action_multiplier = float(hitl_downsample_multiplier)
 
         hitl_shape_meta = (
-            _adjust_downsample(shape_meta, hitl_downsample_multiplier)
+            self._adjust_downsample(
+                shape_meta,
+                obs_multiplier=obs_multiplier,
+                action_multiplier=action_multiplier,
+            )
             if hitl_disable_downsample
             else shape_meta
         )
@@ -146,6 +171,17 @@ class DaggerMixedUmiDataset(BaseDataset):
                     self.datasets,
                 )
             )
+        )
+        print(
+            "[DaggerMixedUmiDataset] HITL ablations: "
+            f"contiguous_action_mask={self.hitl_contiguous_action_mask}, "
+            f"invalid_tail_padding={self.hitl_invalid_tail_padding}, "
+            f"min_valid_steps_enabled={self.hitl_min_valid_steps_enabled}, "
+            f"min_valid_steps={self.hitl_min_valid_steps}, "
+            f"separate_downsample_multipliers="
+            f"{hitl_separate_downsample_multipliers}, "
+            f"obs_multiplier={obs_multiplier}, "
+            f"action_multiplier={action_multiplier}"
         )
 
         # expose shared attributes for convenience
@@ -196,6 +232,33 @@ class DaggerMixedUmiDataset(BaseDataset):
             ]
         return [float(item) for item in list(value)]
 
+    @staticmethod
+    def _adjust_downsample(
+        shape_meta: dict,
+        obs_multiplier: float,
+        action_multiplier: float,
+    ) -> dict:
+        """Scale HITL observation and action strides without mutating shape_meta."""
+        if obs_multiplier <= 0 or action_multiplier <= 0:
+            raise ValueError(
+                "HITL downsample multipliers must be positive, got "
+                f"obs={obs_multiplier}, action={action_multiplier}"
+            )
+
+        meta = copy.deepcopy(shape_meta)
+        for attr in meta.get("obs", {}).values():
+            if "down_sample_steps" in attr:
+                step = float(attr["down_sample_steps"])
+                attr["down_sample_steps"] = max(
+                    1, int(round(step * obs_multiplier))
+                )
+        if "action" in meta and "down_sample_steps" in meta["action"]:
+            step = float(meta["action"]["down_sample_steps"])
+            meta["action"]["down_sample_steps"] = max(
+                1, int(round(step * action_multiplier))
+            )
+        return meta
+
     def _resolve_sampling_weights(self, rlpd_ratio) -> np.ndarray:
         weights = self._coerce_float_list(rlpd_ratio)
         if weights is None:
@@ -241,12 +304,20 @@ class DaggerMixedUmiDataset(BaseDataset):
             try:
                 sample = dataset[mapped_idx]
                 if self.hitl_action_mask:
-                    sample["action_valid_mask"] = self._get_action_valid_mask(
+                    action_valid_mask = self._get_action_valid_mask(
                         dataset=dataset,
                         mapped_idx=mapped_idx,
                         action_length=sample["action"].shape[0],
                         is_online=self.dataset_is_online[dataset_idx],
                     )
+                    if (
+                        self.hitl_invalid_tail_padding
+                        and self.dataset_is_online[dataset_idx]
+                    ):
+                        sample["action"] = self._pad_invalid_action_tail(
+                            sample["action"], action_valid_mask
+                        )
+                    sample["action_valid_mask"] = action_valid_mask
                 return sample
             except JpegxlError as exc:
                 attempt += 1
@@ -289,6 +360,7 @@ class DaggerMixedUmiDataset(BaseDataset):
         return (
             self.hitl_only_tag
             or self.hitl_require_full_action_tag
+            or self.hitl_min_valid_steps_enabled
             or self.hitl_skip_rising_edge
             or self.hitl_treat_segments_as_episodes
         )
@@ -333,6 +405,48 @@ class DaggerMixedUmiDataset(BaseDataset):
     def _future_action_indices(current_idx: int, horizon: int, stride: int) -> np.ndarray:
         return current_idx + np.arange(horizon, dtype=np.int64) * int(stride)
 
+    @staticmethod
+    def _make_contiguous_prefix(mask: np.ndarray) -> np.ndarray:
+        """Keep valid entries only until the first invalid action position."""
+        mask = np.asarray(mask, dtype=np.float32)
+        if mask.ndim != 1:
+            raise ValueError(f"Expected a 1-D action mask, got shape {mask.shape}")
+        return np.cumprod(mask, dtype=np.float32)
+
+    @staticmethod
+    def _count_contiguous_valid_steps(mask: np.ndarray) -> int:
+        """Count leading valid positions in an action mask."""
+        mask = np.asarray(mask).reshape(-1)
+        invalid = np.flatnonzero(mask <= 0)
+        return int(invalid[0]) if len(invalid) > 0 else int(len(mask))
+
+    @staticmethod
+    def _pad_invalid_action_tail(
+        action: torch.Tensor,
+        action_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Repeat the last valid human action over a contiguous invalid suffix."""
+        mask = action_valid_mask.reshape(-1)
+        if action.shape[0] != mask.shape[0]:
+            raise ValueError(
+                "Action/mask length mismatch: "
+                f"action={action.shape[0]}, mask={mask.shape[0]}"
+            )
+
+        invalid = torch.nonzero(mask <= 0, as_tuple=False).flatten()
+        if invalid.numel() == 0:
+            return action
+
+        first_invalid = int(invalid[0].item())
+        if first_invalid == 0:
+            # No human action exists to use as padding. This is possible when
+            # online policy frames are sampled without hitl_only_tag.
+            return action
+
+        padded = action.clone()
+        padded[first_invalid:] = padded[first_invalid - 1]
+        return padded
+
     def _apply_hitl_tag_filter(self, dataset: UmiDataset, dataset_name: str = "hitl") -> None:
         hitl_tag = self._get_hitl_tag(dataset)
         episode_ends = np.asarray(dataset.replay_buffer.episode_ends[:], dtype=np.int64)
@@ -368,6 +482,12 @@ class DaggerMixedUmiDataset(BaseDataset):
             if self.hitl_require_full_action_tag and not np.all(hitl_tag[future_idx] == 1):
                 continue
 
+            if self.hitl_min_valid_steps_enabled:
+                raw_mask = (hitl_tag[future_idx] == 1).astype(np.float32)
+                contiguous_steps = self._count_contiguous_valid_steps(raw_mask)
+                if contiguous_steps < self.hitl_min_valid_steps:
+                    continue
+
             if self.hitl_treat_segments_as_episodes:
                 # Make the sampler pad obs history at the segment start and avoid
                 # supervising labels outside the continuous human-control interval.
@@ -387,6 +507,8 @@ class DaggerMixedUmiDataset(BaseDataset):
             f"{len(dataset.sampler.indices)} samples "
             f"(hitl_only_tag={self.hitl_only_tag}, "
             f"hitl_require_full_action_tag={self.hitl_require_full_action_tag}, "
+            f"hitl_min_valid_steps_enabled={self.hitl_min_valid_steps_enabled}, "
+            f"hitl_min_valid_steps={self.hitl_min_valid_steps}, "
             f"hitl_skip_rising_edge={self.hitl_skip_rising_edge}, "
             f"hitl_skip_rising_edge_steps={self.hitl_skip_rising_edge_steps}, "
             f"hitl_treat_segments_as_episodes={self.hitl_treat_segments_as_episodes})"
@@ -413,6 +535,8 @@ class DaggerMixedUmiDataset(BaseDataset):
         mask = np.zeros(action_length, dtype=np.float32)
         valid = future_idx < len(hitl_tag)
         mask[valid] = (hitl_tag[future_idx[valid]] == 1).astype(np.float32)
+        if self.hitl_contiguous_action_mask:
+            mask = self._make_contiguous_prefix(mask)
         return torch.from_numpy(mask)
 
     # ==================== normalizer ====================
