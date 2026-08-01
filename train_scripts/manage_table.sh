@@ -78,8 +78,8 @@ export TORCH_SHOW_CPP_STACKTRACES=1
 accelerate launch --main_process_port 29501 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
   --config-name=train_diffusion_unet_timm_umi_workspace \
   multi_run.run_dir=${run_dir} multi_run.wandb_name_base=${logging_time} hydra.run.dir=${run_dir} hydra.sweep.dir=${run_dir} \
-  task.dataset_path=../data/dataset/manage_table/teleop_data/manage_table_raw_5_19.zarr.zip \
-  training.num_epochs=300 \
+  task.dataset_path=../data/dataset/manage_table/teleop_data/manage_table_raw_7_27_no_halt_15hz.zarr.zip \
+  training.num_epochs=500 \
   dataloader.batch_size=64 \
   dataloader.num_workers=16 \
   dataloader.persistent_workers=True \
