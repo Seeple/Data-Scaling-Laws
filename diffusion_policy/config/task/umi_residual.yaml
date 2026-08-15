@@ -1,0 +1,22 @@
+defaults:
+  - umi
+  - _self_
+
+name: umi_residual
+residual_dataset_path: ${oc.env:RESIDUAL_DATASET_PATH,example_residual.zarr.zip}
+
+dataset:
+  _target_: diffusion_policy.dataset.umi_residual_dataset.UmiResidualDataset
+  dataset_path: ${task.residual_dataset_path}
+  shape_meta: ${task.shape_meta}
+  sample_mode: all                 # all | correction_only | zero_only
+  split: train
+  seed: 42
+  val_ratio: 0.15
+  val_episode_indices: null        # explicit episode-level holdout, if desired
+  expected_schema_version: 1
+  residual_scale_quantile: 0.995
+  residual_minimum_scale: 1.0e-4
+  correction_fraction: 0.5         # balanced positive/zero sampling for mode=all
+  strict_recomposition_tolerance: 1.0e-5
+  return_metadata: false
