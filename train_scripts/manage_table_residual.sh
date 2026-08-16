@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Chunk-level active-plan residual training for manage_table.
+# Chunk-level active-plan residual training. The historical filename remains
+# for compatibility; set TASK_NAME for other tasks.
 #
 # Required:
 #   BASE_POLICY_CKPT=/path/to/base.ckpt
@@ -16,6 +17,10 @@ set -euo pipefail
 #   BASE_POLICY_CKPT=../data/ckpts/manage_table/teleop/base.ckpt \
 #   RESIDUAL_DATASET_PATH=../data/dataset/manage_table/residual.zarr.zip \
 #   VARIANT=mixed_gate bash manage_table_residual.sh
+#
+# Hang Chinese Knot:
+#   TASK_NAME=hang_chinese_knot VARIANT=mixed_gate \
+#     bash manage_table_residual.sh
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "${SCRIPT_DIR}"
@@ -24,6 +29,7 @@ cd "${SCRIPT_DIR}"
 : "${RESIDUAL_DATASET_PATH:?Set RESIDUAL_DATASET_PATH to residual Zarr}"
 
 VARIANT="${VARIANT:-mixed_no_gate}"
+TASK_NAME="${TASK_NAME:-manage_table}"
 GPU_LIST="${GPU_LIST:-}"
 NUM_PROCESSES="${NUM_PROCESSES:-}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29511}"
@@ -69,7 +75,7 @@ esac
 
 logging_time="$(date '+%d-%H.%M.%S')"
 now_date="$(date '+%Y.%m.%d')"
-run_dir="data/outputs/${now_date}/${logging_time: -8}_residual_${VARIANT}"
+run_dir="data/outputs/${now_date}/${logging_time: -8}_${TASK_NAME}_residual_${VARIANT}"
 mkdir -p "${run_dir}"
 
 ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-${SCRIPT_DIR}/../accelerate_config.yaml}"
@@ -105,5 +111,5 @@ accelerate launch \
   val_dataloader.persistent_workers="$([ "${NUM_WORKERS}" -gt 0 ] && echo true || echo false)" \
   optimizer.lr="${LEARNING_RATE}" \
   logging.use_wandb="${USE_WANDB}" \
-  logging.name="${logging_time}_manage_table_residual_${VARIANT}" \
+  logging.name="${logging_time}_${TASK_NAME}_residual_${VARIANT}" \
   2>&1 | tee "${run_dir}/train.log"
