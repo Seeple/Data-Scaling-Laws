@@ -40,6 +40,9 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 LEARNING_RATE="${LEARNING_RATE:-3e-4}"
 CORRECTION_FRACTION="${CORRECTION_FRACTION:-0.5}"
 VAL_RATIO="${VAL_RATIO:-0.15}"
+# Set an explicit Hydra list (for example '[2,13,18,21]') to keep
+# correction-only / mixed / gated ablations on exactly the same episodes.
+VAL_EPISODE_INDICES="${VAL_EPISODE_INDICES:-null}"
 USE_WANDB="${USE_WANDB:-true}"
 ENCODER_MODE="${ENCODER_MODE:-eval}"
 CONDITION_ON_BASE_ACTION="${CONDITION_ON_BASE_ACTION:-true}"
@@ -99,6 +102,7 @@ accelerate launch \
   task.dataset.sample_mode="${SAMPLE_MODE}" \
   task.dataset.correction_fraction="${CORRECTION_FRACTION_ARG}" \
   task.dataset.val_ratio="${VAL_RATIO}" \
+  task.dataset.val_episode_indices="${VAL_EPISODE_INDICES}" \
   policy.model.gate_enabled="${GATE_ENABLED}" \
   policy.model.condition_on_base_action="${CONDITION_ON_BASE_ACTION}" \
   policy.zero_loss_weight="${ZERO_LOSS_WEIGHT}" \
