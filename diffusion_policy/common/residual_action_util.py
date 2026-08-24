@@ -20,7 +20,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from diffusion_policy.common.pose_repr_util import convert_pose_mat_rep
-from umi.common.pose_util import mat_to_pose10d
+from umi.common.pose_util import mat_to_pose10d, pose10d_to_mat
 
 
 ABSOLUTE_ACTION_DIM = 8
@@ -132,6 +132,41 @@ def absolute_action8_to_relative_action10(
     return np.concatenate([relative_pose9, action[:, 7:8]], axis=-1).astype(
         np.float32
     )
+
+
+def relative_action10_to_absolute_action8(
+    relative_action: np.ndarray,
+    latest_observation_pose: np.ndarray,
+) -> np.ndarray:
+    """Invert the base DP action transform for offline base resampling."""
+    action = _as_float_array(relative_action, "relative action")
+    if action.ndim != 2 or action.shape[1] != BASE_ACTION_DIM:
+        raise ValueError(
+            "relative action must have shape (horizon, 10), got "
+            f"{action.shape}"
+        )
+    latest_pose = _as_float_array(
+        latest_observation_pose, "latest_observation_pose"
+    )
+    if latest_pose.shape != (4, 4):
+        raise ValueError(
+            "latest_observation_pose must have shape (4, 4), got "
+            f"{latest_pose.shape}"
+        )
+    relative_matrix = pose10d_to_mat(action[:, :9])
+    absolute_matrix = convert_pose_mat_rep(
+        relative_matrix,
+        base_pose_mat=latest_pose,
+        pose_rep="relative",
+        backward=True,
+    )
+    quaternion_xyzw = Rotation.from_matrix(
+        absolute_matrix[:, :3, :3]
+    ).as_quat()
+    return np.concatenate(
+        [absolute_matrix[:, :3, 3], quaternion_xyzw, action[:, 9:10]],
+        axis=-1,
+    ).astype(np.float32)
 
 
 def compute_world_frame_residual(

@@ -7,6 +7,7 @@ from diffusion_policy.common.residual_action_util import (
     compose_world_frame_residual,
     compute_world_frame_residual,
     fit_zero_centered_scale,
+    relative_action10_to_absolute_action8,
 )
 
 
@@ -45,6 +46,14 @@ def test_absolute_action_to_relative_base_frame():
         relative[:, :3], action[:, :3] - base_pose[:3, 3], atol=1e-7
     )
     assert relative.shape == (2, 10)
+    round_trip = relative_action10_to_absolute_action8(relative, base_pose)
+    np.testing.assert_allclose(round_trip[:, :3], action[:, :3], atol=1e-7)
+    rotation_error = (
+        Rotation.from_quat(round_trip[:, 3:7]).inv()
+        * Rotation.from_quat(action[:, 3:7])
+    ).magnitude()
+    assert rotation_error.max() < 1e-7
+    np.testing.assert_allclose(round_trip[:, 7], action[:, 7], atol=1e-7)
 
 
 def test_zero_centered_scale_and_norm_clipping():

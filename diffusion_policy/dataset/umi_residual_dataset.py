@@ -35,6 +35,10 @@ register_codecs()
 
 EXPECTED_SCHEMA = "superinference.residual_policy_events"
 EXPECTED_SCHEMA_VERSION = 1
+ACTION_ALIGNMENT_RECORDED_CHUNK = "recorded_chunk"
+ACTION_ALIGNMENT_ACTIVE_SUFFIX = "active_suffix_left_aligned"
+VALID_MASK_LAYOUT_SUFFIX = "contiguous_suffix"
+VALID_MASK_LAYOUT_PREFIX = "contiguous_prefix"
 
 
 class UmiResidualDataset(BaseImageDataset):
@@ -55,9 +59,11 @@ class UmiResidualDataset(BaseImageDataset):
         val_ratio: float = 0.15,
         val_episode_indices: Optional[Sequence[int]] = None,
         expected_schema_version: int = EXPECTED_SCHEMA_VERSION,
+        expected_action_alignment: Optional[str] = None,
         residual_scale_quantile: float = 0.995,
         residual_minimum_scale: float = 1e-4,
         correction_fraction: Optional[float] = 0.5,
+        balance_corrections_by_source_event: bool = True,
         strict_recomposition_tolerance: float = 1e-5,
         return_metadata: bool = False,
         **_unused_umi_dataset_kwargs,
@@ -75,12 +81,20 @@ class UmiResidualDataset(BaseImageDataset):
             else tuple(int(value) for value in val_episode_indices)
         )
         self.expected_schema_version = int(expected_schema_version)
+        self.expected_action_alignment = (
+            None
+            if expected_action_alignment in {None, "", "auto"}
+            else str(expected_action_alignment)
+        )
         self.residual_scale_quantile = float(residual_scale_quantile)
         self.residual_minimum_scale = float(residual_minimum_scale)
         self.correction_fraction = (
             None
             if correction_fraction is None
             else float(correction_fraction)
+        )
+        self.balance_corrections_by_source_event = bool(
+            balance_corrections_by_source_event
         )
         self.strict_recomposition_tolerance = float(
             strict_recomposition_tolerance
@@ -152,6 +166,16 @@ class UmiResidualDataset(BaseImageDataset):
         self.recorded_base_checkpoint_sha256 = str(
             self._root.attrs.get("base_policy_checkpoint_sha256", "")
         )
+        self.action_alignment = str(
+            self._root.attrs.get(
+                "action_alignment", ACTION_ALIGNMENT_RECORDED_CHUNK
+            )
+        )
+        self.valid_action_mask_layout = str(
+            self._root.attrs.get(
+                "valid_action_mask_layout", VALID_MASK_LAYOUT_SUFFIX
+            )
+        )
         if schema != EXPECTED_SCHEMA:
             raise ValueError(
                 f"Unexpected residual schema {schema!r}; expected "
@@ -161,6 +185,32 @@ class UmiResidualDataset(BaseImageDataset):
             raise ValueError(
                 "Residual schema version mismatch: expected "
                 f"{self.expected_schema_version}, got {schema_version}"
+            )
+        if self.action_alignment not in {
+            ACTION_ALIGNMENT_RECORDED_CHUNK,
+            ACTION_ALIGNMENT_ACTIVE_SUFFIX,
+        }:
+            raise ValueError(
+                f"Unsupported residual action alignment: {self.action_alignment}"
+            )
+        expected_layout = (
+            VALID_MASK_LAYOUT_PREFIX
+            if self.action_alignment == ACTION_ALIGNMENT_ACTIVE_SUFFIX
+            else VALID_MASK_LAYOUT_SUFFIX
+        )
+        if self.valid_action_mask_layout != expected_layout:
+            raise ValueError(
+                "Residual action alignment/mask layout mismatch: "
+                f"{self.action_alignment} requires {expected_layout}, got "
+                f"{self.valid_action_mask_layout}"
+            )
+        if (
+            self.expected_action_alignment is not None
+            and self.action_alignment != self.expected_action_alignment
+        ):
+            raise ValueError(
+                "Residual dataset action alignment mismatch: expected "
+                f"{self.expected_action_alignment}, got {self.action_alignment}"
             )
 
         required = {
@@ -260,6 +310,17 @@ class UmiResidualDataset(BaseImageDataset):
 
         self.labels = labels[self.indices]
         self.episode_ids = episode_ids[self.indices]
+        if "multibase_source_sample_index" in self._data:
+            all_family_ids = np.asarray(
+                self._data["multibase_source_sample_index"][:], dtype=np.int64
+            )
+            if all_family_ids.shape != (sample_count,):
+                raise ValueError(
+                    "multibase_source_sample_index has an invalid shape"
+                )
+            self.correction_family_ids = all_family_ids[self.indices]
+        else:
+            self.correction_family_ids = self.indices.copy()
         self.validation_episode_indices = tuple(
             int(value) for value in val_episodes.tolist()
         )
@@ -281,11 +342,21 @@ class UmiResidualDataset(BaseImageDataset):
         )
         for local_index, (mask, anchor) in enumerate(zip(masks, anchors)):
             expected = np.zeros(self.action_horizon, dtype=np.uint8)
-            expected[int(anchor) :] = 1
+            if self.valid_action_mask_layout == VALID_MASK_LAYOUT_PREFIX:
+                valid_length = int(np.count_nonzero(mask))
+                if int(anchor) != 0:
+                    raise ValueError(
+                        f"Sample {int(self.indices[local_index])} has an "
+                        "active-suffix anchor other than zero"
+                    )
+                expected[:valid_length] = 1
+            else:
+                expected[int(anchor) :] = 1
             if not np.array_equal(mask, expected):
                 source_index = int(self.indices[local_index])
                 raise ValueError(
-                    f"Sample {source_index} has a non-contiguous suffix mask"
+                    f"Sample {source_index} has an invalid "
+                    f"{self.valid_action_mask_layout} mask"
                 )
 
         # Strictly check stored residual fields against base/final geometry.
@@ -446,9 +517,13 @@ class UmiResidualDataset(BaseImageDataset):
             val_ratio=self.val_ratio,
             val_episode_indices=self.validation_episode_indices,
             expected_schema_version=self.expected_schema_version,
+            expected_action_alignment=self.expected_action_alignment,
             residual_scale_quantile=self.residual_scale_quantile,
             residual_minimum_scale=self.residual_minimum_scale,
             correction_fraction=self.correction_fraction,
+            balance_corrections_by_source_event=(
+                self.balance_corrections_by_source_event
+            ),
             strict_recomposition_tolerance=self.strict_recomposition_tolerance,
             return_metadata=self.return_metadata,
         )
@@ -467,7 +542,24 @@ class UmiResidualDataset(BaseImageDataset):
                 "zero-attempt samples"
             )
         weights = np.empty(len(self), dtype=np.float64)
-        weights[correction] = self.correction_fraction / correction_count
+        if self.balance_corrections_by_source_event:
+            correction_families = self.correction_family_ids[correction]
+            unique_families, family_counts = np.unique(
+                correction_families, return_counts=True
+            )
+            family_count_by_id = dict(zip(unique_families, family_counts))
+            correction_family_count = len(unique_families)
+            weights[correction] = np.asarray(
+                [
+                    self.correction_fraction
+                    / correction_family_count
+                    / family_count_by_id[family_id]
+                    for family_id in correction_families
+                ],
+                dtype=np.float64,
+            )
+        else:
+            weights[correction] = self.correction_fraction / correction_count
         weights[zero] = (1.0 - self.correction_fraction) / zero_count
         return torch.from_numpy(weights)
 
@@ -546,5 +638,13 @@ class UmiResidualDataset(BaseImageDataset):
             "recorded_base_policy_class": self.recorded_base_policy_class,
             "recorded_base_checkpoint_sha256": (
                 self.recorded_base_checkpoint_sha256
+            ),
+            "action_alignment": self.action_alignment,
+            "valid_action_mask_layout": self.valid_action_mask_layout,
+            "balance_corrections_by_source_event": (
+                self.balance_corrections_by_source_event
+            ),
+            "correction_family_count": int(
+                len(np.unique(self.correction_family_ids[self.labels == 1]))
             ),
         }

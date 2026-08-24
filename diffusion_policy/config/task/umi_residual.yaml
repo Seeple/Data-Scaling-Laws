@@ -15,8 +15,14 @@ dataset:
   val_ratio: 0.15
   val_episode_indices: null        # explicit episode-level holdout, if desired
   expected_schema_version: 1
+  # null/auto accepts either strict contract. Set explicitly in experiments to
+  # prevent deploying a recorded-chunk checkpoint as an active-suffix model.
+  expected_action_alignment: null  # recorded_chunk | active_suffix_left_aligned
   residual_scale_quantile: 0.995
   residual_minimum_scale: 1.0e-4
   correction_fraction: 0.5         # balanced positive/zero sampling for mode=all
+  # A correction and all accepted multi-base variants share the same total
+  # sampling mass, so easy-to-resample events do not dominate the dataset.
+  balance_corrections_by_source_event: true
   strict_recomposition_tolerance: 1.0e-5
   return_metadata: false

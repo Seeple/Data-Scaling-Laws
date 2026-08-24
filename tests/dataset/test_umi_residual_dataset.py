@@ -22,7 +22,7 @@ def _shape_meta():
     return {"obs": obs, "action": {"shape": [10], "horizon": 16}}
 
 
-def _write_dataset(path: Path):
+def _write_dataset(path: Path, active_suffix: bool = False):
     sample_count, horizon = 4, 16
     base = np.zeros((sample_count, horizon, 8), dtype=np.float32)
     base[..., :3] = [0.4, 0.0, 0.3]
@@ -36,6 +36,16 @@ def _write_dataset(path: Path):
     masks[2, :6] = 0
     edited[0, 4:, 0] += 0.01
     edited[2, 6:, 1] -= 0.02
+    if active_suffix:
+        masks[0] = 0
+        masks[0, :12] = 1
+        masks[2] = 0
+        masks[2, :10] = 1
+        anchors[[0, 2]] = 0
+        edited[0] = base[0]
+        edited[2] = base[2]
+        edited[0, :12, 0] += 0.01
+        edited[2, :10, 1] -= 0.02
     residual = np.stack(
         [compute_world_frame_residual(b, e) for b, e in zip(base, edited)]
     )
@@ -73,6 +83,12 @@ def _write_dataset(path: Path):
             "observation_horizon": 2,
             "action_horizon": horizon,
             "action_dim": 8,
+            "action_alignment": (
+                "active_suffix_left_aligned" if active_suffix else "recorded_chunk"
+            ),
+            "valid_action_mask_layout": (
+                "contiguous_prefix" if active_suffix else "contiguous_suffix"
+            ),
         }
     )
     store.close()
@@ -105,3 +121,32 @@ def test_residual_dataset_contract_and_episode_split(tmp_path):
     validation = dataset.get_validation_dataset()
     assert len(validation) == 2
     assert set(validation.episode_ids.tolist()) == {1}
+
+
+def test_active_suffix_prefix_mask_contract(tmp_path):
+    path = tmp_path / "active_residual.zarr.zip"
+    _write_dataset(path, active_suffix=True)
+    dataset = UmiResidualDataset(
+        dataset_path=str(path),
+        shape_meta=_shape_meta(),
+        sample_mode="all",
+        split="all",
+        val_ratio=0.0,
+        correction_fraction=0.5,
+        expected_action_alignment="active_suffix_left_aligned",
+    )
+    assert dataset.action_alignment == "active_suffix_left_aligned"
+    assert dataset.valid_action_mask_layout == "contiguous_prefix"
+    assert dataset.audit_summary()["valid_correction_coverage"][:4] == [2, 2, 2, 2]
+
+
+def test_multibase_sampling_balances_correction_families():
+    dataset = object.__new__(UmiResidualDataset)
+    dataset.indices = np.arange(4)
+    dataset.labels = np.array([1, 1, 1, 0], dtype=np.uint8)
+    dataset.correction_family_ids = np.array([5, 5, 9, 3], dtype=np.int64)
+    dataset.sample_mode = "all"
+    dataset.correction_fraction = 0.5
+    dataset.balance_corrections_by_source_event = True
+    weights = dataset.get_sampling_weights().numpy()
+    np.testing.assert_allclose(weights, [0.125, 0.125, 0.25, 0.5])

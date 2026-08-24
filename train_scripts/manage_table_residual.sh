@@ -12,6 +12,7 @@ set -euo pipefail
 #   VARIANT=correction_only  # capacity/smoke test; no zero supervision or gate
 #   VARIANT=mixed_no_gate    # correction + zero attempts, balanced 1:1
 #   VARIANT=mixed_gate       # same data plus explicit chunk-level gate
+#   ACTION_ALIGNMENT=recorded_chunk | active_suffix_left_aligned
 #
 # Example:
 #   BASE_POLICY_CKPT=../data/ckpts/manage_table/teleop/base.ckpt \
@@ -46,6 +47,11 @@ VAL_EPISODE_INDICES="${VAL_EPISODE_INDICES:-null}"
 USE_WANDB="${USE_WANDB:-true}"
 ENCODER_MODE="${ENCODER_MODE:-eval}"
 CONDITION_ON_BASE_ACTION="${CONDITION_ON_BASE_ACTION:-true}"
+# Set to recorded_chunk or active_suffix_left_aligned. "auto" keeps backward
+# compatibility, but explicit values are recommended for real experiments.
+ACTION_ALIGNMENT="${ACTION_ALIGNMENT:-auto}"
+CORRECTION_LOSS_WEIGHT="${CORRECTION_LOSS_WEIGHT:-1.0}"
+GATE_LOSS_WEIGHT="${GATE_LOSS_WEIGHT:-1.0}"
 
 if [ -n "${GPU_LIST}" ]; then
   export CUDA_VISIBLE_DEVICES="${GPU_LIST}"
@@ -103,9 +109,12 @@ accelerate launch \
   task.dataset.correction_fraction="${CORRECTION_FRACTION_ARG}" \
   task.dataset.val_ratio="${VAL_RATIO}" \
   task.dataset.val_episode_indices="${VAL_EPISODE_INDICES}" \
+  task.dataset.expected_action_alignment="${ACTION_ALIGNMENT}" \
   policy.model.gate_enabled="${GATE_ENABLED}" \
   policy.model.condition_on_base_action="${CONDITION_ON_BASE_ACTION}" \
   policy.zero_loss_weight="${ZERO_LOSS_WEIGHT}" \
+  policy.correction_loss_weight="${CORRECTION_LOSS_WEIGHT}" \
+  policy.gate_loss_weight="${GATE_LOSS_WEIGHT}" \
   base_policy.encoder_mode="${ENCODER_MODE}" \
   training.num_epochs="${NUM_EPOCHS}" \
   dataloader.batch_size="${BATCH_SIZE}" \

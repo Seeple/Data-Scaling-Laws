@@ -51,6 +51,8 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         "base_checkpoint_sha256",
         "base_checkpoint_state_key",
         "residual_schema_version",
+        "residual_action_alignment",
+        "residual_valid_action_mask_layout",
     )
     exclude_keys = ("base_policy",)
 
@@ -74,6 +76,8 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         self.residual_schema_version = int(
             cfg.task.dataset.expected_schema_version
         )
+        self.residual_action_alignment = "unknown"
+        self.residual_valid_action_mask_layout = "unknown"
         if not hasattr(self.base_policy, "obs_encoder"):
             raise TypeError("Base checkpoint policy has no obs_encoder")
         if not hasattr(self.base_policy, "normalizer"):
@@ -298,6 +302,10 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         if not isinstance(dataset, UmiResidualDataset):
             raise TypeError("Residual workspace requires UmiResidualDataset")
+        self.residual_action_alignment = dataset.action_alignment
+        self.residual_valid_action_mask_layout = (
+            dataset.valid_action_mask_layout
+        )
         if (
             dataset.recorded_base_checkpoint_sha256
             and dataset.recorded_base_checkpoint_sha256
