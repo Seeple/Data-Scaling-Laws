@@ -1,0 +1,112 @@
+defaults:
+  - task: umi_step_active_plan_residual
+  - _self_
+
+name: train_step_active_plan_residual_mlp
+_target_: diffusion_policy.workspace.train_chunk_residual_workspace.TrainChunkResidualWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: step_active_plan_h${task.residual_horizon}
+
+base_policy:
+  ckpt_path: ${oc.env:BASE_POLICY_CKPT,null}
+  prefer_ema: true
+  encoder_mode: eval               # eval | train_transforms
+
+policy:
+  _target_: diffusion_policy.policy.chunk_residual_policy.ChunkResidualPolicy
+  model:
+    _target_: diffusion_policy.model.residual.chunk_residual_mlp.ChunkResidualMLP
+    action_horizon: null
+    base_action_horizon: ${task.residual_horizon}
+    residual_horizon: ${task.residual_horizon}
+    base_action_dim: ${task.shape_meta.action.shape.0}
+    residual_action_dim: 7
+    obs_projection_dim: 256
+    base_chunk_feature_dim: 256
+    hidden_dims: [512, 512, 256]
+    dropout: 0.1
+    condition_on_base_action: true
+    gate_enabled: false
+    zero_initialize_residual_head: true
+    gate_initial_probability: 0.1
+  correction_loss_weight: 1.0
+  zero_loss_weight: 1.0
+  gate_loss_weight: 1.0
+  invalid_prefix_zero_prior_weight: 0.0
+  temporal_smoothness_weight: 0.0
+  huber_delta: 1.0
+  gate_inference_mode: hard
+  gate_threshold: 0.5
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 4
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 3.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+training:
+  device: cuda:0
+  seed: 42
+  debug: false
+  resume: false
+  num_epochs: 200
+  lr_scheduler: cosine
+  lr_warmup_steps: 100
+  gradient_accumulate_every: 1
+  max_grad_norm: 1.0
+  use_ema: true
+  val_every: 1
+  checkpoint_every: 10
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: umi-residual
+  use_wandb: true
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}_${exp_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+  resume: false
+
+checkpoint:
+  topk:
+    monitor_key: val_composite_objective
+    mode: min
+    k: 2
+    format_str: epoch={epoch:04d}-val_composite_objective={val_composite_objective:.5f}.ckpt
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_${exp_name}

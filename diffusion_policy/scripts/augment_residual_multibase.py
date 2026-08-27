@@ -42,6 +42,9 @@ from diffusion_policy.common.residual_multibase_util import (
 )
 from diffusion_policy.dataset.umi_residual_dataset import (
     ACTION_ALIGNMENT_ACTIVE_SUFFIX,
+    ACTION_ALIGNMENT_STEP_ACTIVE_PLAN,
+    EXPECTED_SCHEMA,
+    STEP_ACTIVE_PLAN_SCHEMA,
     UmiResidualDataset,
 )
 
@@ -192,6 +195,20 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         prefer_ema=not args.use_model_weights,
     )
     shape_meta = _shape_meta_from_checkpoint(frozen.checkpoint_cfg)
+    with zarr.ZipStore(str(input_path), mode="r") as inspection_store:
+        inspection_root = zarr.group(store=inspection_store)
+        source_schema = str(inspection_root.attrs.get("schema", ""))
+        source_horizon = int(inspection_root.attrs.get("action_horizon", -1))
+    if source_schema == EXPECTED_SCHEMA:
+        expected_alignment = ACTION_ALIGNMENT_ACTIVE_SUFFIX
+        dataset_horizon = None
+    elif source_schema == STEP_ACTIVE_PLAN_SCHEMA:
+        expected_alignment = ACTION_ALIGNMENT_STEP_ACTIVE_PLAN
+        dataset_horizon = source_horizon
+    else:
+        raise ValueError(
+            f"Unsupported residual dataset schema: {source_schema!r}"
+        )
     dataset = UmiResidualDataset(
         dataset_path=str(input_path),
         shape_meta=shape_meta,
@@ -199,7 +216,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         split="all",
         val_ratio=0.0,
         correction_fraction=None,
-        expected_action_alignment=ACTION_ALIGNMENT_ACTIVE_SUFFIX,
+        expected_schema=source_schema,
+        expected_action_alignment=expected_alignment,
+        action_horizon=dataset_horizon,
         return_metadata=True,
     )
     if (
@@ -268,6 +287,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             relative_candidates = relative_candidates.detach().cpu().numpy()
             for relative_candidate in relative_candidates:
                 draw_count += 1
+                # A step-active sample is left-aligned at the current
+                # observation, so its H-step base window is the prefix of a
+                # freshly resampled full Diffusion Policy chunk.
+                relative_candidate = relative_candidate[
+                    : dataset.action_horizon
+                ]
                 candidate = relative_action10_to_absolute_action8(
                     relative_candidate, latest_pose
                 )
@@ -309,6 +334,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "output": str(output_path),
         "base_policy_checkpoint": frozen.checkpoint_path,
         "base_policy_checkpoint_sha256": frozen.checkpoint_sha256,
+        "dataset_schema": source_schema,
+        "action_alignment": expected_alignment,
+        "action_horizon": dataset.action_horizon,
         "seed": args.seed,
         "candidates_per_correction": args.candidates_per_correction,
         "correction_count": int(len(correction_local_indices)),
@@ -344,7 +372,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Append filtered frozen-policy resamples to active-suffix residual Zarr"
+        description=(
+            "Append filtered frozen-policy resamples to active-suffix or "
+            "step-active-plan residual Zarr"
+        )
     )
     parser.add_argument("input_path", type=Path)
     parser.add_argument("output_path", type=Path)

@@ -53,6 +53,8 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         "residual_schema_version",
         "residual_action_alignment",
         "residual_valid_action_mask_layout",
+        "residual_base_action_horizon",
+        "residual_prediction_horizon",
     )
     exclude_keys = ("base_policy",)
 
@@ -107,6 +109,8 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         policy_cfg.pop("_target_", None)
         policy_cfg.pop("model", None)
         self.model = ChunkResidualPolicy(model=residual_model, **policy_cfg)
+        self.residual_base_action_horizon = self.model.base_action_horizon
+        self.residual_prediction_horizon = self.model.residual_horizon
         self.ema_model = (
             copy.deepcopy(self.model) if bool(cfg.training.use_ema) else None
         )
@@ -306,6 +310,18 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         self.residual_valid_action_mask_layout = (
             dataset.valid_action_mask_layout
         )
+        if dataset.action_horizon != self.model.base_action_horizon:
+            raise ValueError(
+                "Residual dataset/model base horizon mismatch: dataset="
+                f"{dataset.action_horizon}, model="
+                f"{self.model.base_action_horizon}"
+            )
+        if dataset.action_horizon != self.model.residual_horizon:
+            raise ValueError(
+                "Residual dataset/model prediction horizon mismatch: dataset="
+                f"{dataset.action_horizon}, model="
+                f"{self.model.residual_horizon}"
+            )
         if (
             dataset.recorded_base_checkpoint_sha256
             and dataset.recorded_base_checkpoint_sha256

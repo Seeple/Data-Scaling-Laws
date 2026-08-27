@@ -35,8 +35,10 @@ register_codecs()
 
 EXPECTED_SCHEMA = "superinference.residual_policy_events"
 EXPECTED_SCHEMA_VERSION = 1
+STEP_ACTIVE_PLAN_SCHEMA = "superinference.step_active_plan_residual"
 ACTION_ALIGNMENT_RECORDED_CHUNK = "recorded_chunk"
 ACTION_ALIGNMENT_ACTIVE_SUFFIX = "active_suffix_left_aligned"
+ACTION_ALIGNMENT_STEP_ACTIVE_PLAN = "step_active_plan_left_aligned"
 VALID_MASK_LAYOUT_SUFFIX = "contiguous_suffix"
 VALID_MASK_LAYOUT_PREFIX = "contiguous_prefix"
 
@@ -58,12 +60,15 @@ class UmiResidualDataset(BaseImageDataset):
         seed: int = 42,
         val_ratio: float = 0.15,
         val_episode_indices: Optional[Sequence[int]] = None,
+        expected_schema: str = EXPECTED_SCHEMA,
         expected_schema_version: int = EXPECTED_SCHEMA_VERSION,
         expected_action_alignment: Optional[str] = None,
+        action_horizon: Optional[int] = None,
         residual_scale_quantile: float = 0.995,
         residual_minimum_scale: float = 1e-4,
         correction_fraction: Optional[float] = 0.5,
         balance_corrections_by_source_event: bool = True,
+        balance_zeros_by_source_event: bool = False,
         strict_recomposition_tolerance: float = 1e-5,
         return_metadata: bool = False,
         **_unused_umi_dataset_kwargs,
@@ -81,10 +86,14 @@ class UmiResidualDataset(BaseImageDataset):
             else tuple(int(value) for value in val_episode_indices)
         )
         self.expected_schema_version = int(expected_schema_version)
+        self.expected_schema = str(expected_schema)
         self.expected_action_alignment = (
             None
             if expected_action_alignment in {None, "", "auto"}
             else str(expected_action_alignment)
+        )
+        self.expected_action_horizon = (
+            None if action_horizon is None else int(action_horizon)
         )
         self.residual_scale_quantile = float(residual_scale_quantile)
         self.residual_minimum_scale = float(residual_minimum_scale)
@@ -95,6 +104,9 @@ class UmiResidualDataset(BaseImageDataset):
         )
         self.balance_corrections_by_source_event = bool(
             balance_corrections_by_source_event
+        )
+        self.balance_zeros_by_source_event = bool(
+            balance_zeros_by_source_event
         )
         self.strict_recomposition_tolerance = float(
             strict_recomposition_tolerance
@@ -176,10 +188,10 @@ class UmiResidualDataset(BaseImageDataset):
                 "valid_action_mask_layout", VALID_MASK_LAYOUT_SUFFIX
             )
         )
-        if schema != EXPECTED_SCHEMA:
+        if schema != self.expected_schema:
             raise ValueError(
                 f"Unexpected residual schema {schema!r}; expected "
-                f"{EXPECTED_SCHEMA!r}"
+                f"{self.expected_schema!r}"
             )
         if schema_version != self.expected_schema_version:
             raise ValueError(
@@ -189,13 +201,18 @@ class UmiResidualDataset(BaseImageDataset):
         if self.action_alignment not in {
             ACTION_ALIGNMENT_RECORDED_CHUNK,
             ACTION_ALIGNMENT_ACTIVE_SUFFIX,
+            ACTION_ALIGNMENT_STEP_ACTIVE_PLAN,
         }:
             raise ValueError(
                 f"Unsupported residual action alignment: {self.action_alignment}"
             )
         expected_layout = (
             VALID_MASK_LAYOUT_PREFIX
-            if self.action_alignment == ACTION_ALIGNMENT_ACTIVE_SUFFIX
+            if self.action_alignment
+            in {
+                ACTION_ALIGNMENT_ACTIVE_SUFFIX,
+                ACTION_ALIGNMENT_STEP_ACTIVE_PLAN,
+            }
             else VALID_MASK_LAYOUT_SUFFIX
         )
         if self.valid_action_mask_layout != expected_layout:
@@ -240,7 +257,11 @@ class UmiResidualDataset(BaseImageDataset):
         expected_obs_horizon = int(
             self.shape_meta["obs"]["camera0_rgb"]["horizon"]
         )
-        expected_action_horizon = int(self.shape_meta["action"]["horizon"])
+        expected_action_horizon = (
+            int(self.shape_meta["action"]["horizon"])
+            if self.expected_action_horizon is None
+            else self.expected_action_horizon
+        )
         if sample_count <= 0:
             raise ValueError("Residual Zarr contains no samples")
         if observation_horizon != expected_obs_horizon:
@@ -252,7 +273,7 @@ class UmiResidualDataset(BaseImageDataset):
         if action_horizon != expected_action_horizon:
             raise ValueError(
                 f"Action horizon mismatch: dataset has {action_horizon}, "
-                f"shape_meta expects {expected_action_horizon}"
+                f"dataset config expects {expected_action_horizon}"
             )
         if action_dim != ABSOLUTE_ACTION_DIM:
             raise ValueError(
@@ -310,7 +331,14 @@ class UmiResidualDataset(BaseImageDataset):
 
         self.labels = labels[self.indices]
         self.episode_ids = episode_ids[self.indices]
-        if "multibase_source_sample_index" in self._data:
+        if "source_event_index" in self._data:
+            all_family_ids = np.asarray(
+                self._data["source_event_index"][:], dtype=np.int64
+            )
+            if all_family_ids.shape != (sample_count,):
+                raise ValueError("source_event_index has an invalid shape")
+            self.sample_family_ids = all_family_ids[self.indices]
+        elif "multibase_source_sample_index" in self._data:
             all_family_ids = np.asarray(
                 self._data["multibase_source_sample_index"][:], dtype=np.int64
             )
@@ -318,9 +346,11 @@ class UmiResidualDataset(BaseImageDataset):
                 raise ValueError(
                     "multibase_source_sample_index has an invalid shape"
                 )
-            self.correction_family_ids = all_family_ids[self.indices]
+            self.sample_family_ids = all_family_ids[self.indices]
         else:
-            self.correction_family_ids = self.indices.copy()
+            self.sample_family_ids = self.indices.copy()
+        # Historical name retained for external analysis scripts.
+        self.correction_family_ids = self.sample_family_ids
         self.validation_episode_indices = tuple(
             int(value) for value in val_episodes.tolist()
         )
@@ -505,6 +535,15 @@ class UmiResidualDataset(BaseImageDataset):
                     ),
                 }
             )
+            for metadata_key in (
+                "source_event_index",
+                "source_action_index",
+                "policy_chunk_generation_id",
+            ):
+                if metadata_key in self._data:
+                    sample[metadata_key] = torch.tensor(
+                        int(self._load_array(metadata_key, source_index))
+                    )
         return sample
 
     def get_validation_dataset(self) -> "UmiResidualDataset":
@@ -516,14 +555,17 @@ class UmiResidualDataset(BaseImageDataset):
             seed=self.seed,
             val_ratio=self.val_ratio,
             val_episode_indices=self.validation_episode_indices,
+            expected_schema=self.expected_schema,
             expected_schema_version=self.expected_schema_version,
             expected_action_alignment=self.expected_action_alignment,
+            action_horizon=self.expected_action_horizon,
             residual_scale_quantile=self.residual_scale_quantile,
             residual_minimum_scale=self.residual_minimum_scale,
             correction_fraction=self.correction_fraction,
             balance_corrections_by_source_event=(
                 self.balance_corrections_by_source_event
             ),
+            balance_zeros_by_source_event=self.balance_zeros_by_source_event,
             strict_recomposition_tolerance=self.strict_recomposition_tolerance,
             return_metadata=self.return_metadata,
         )
@@ -542,8 +584,11 @@ class UmiResidualDataset(BaseImageDataset):
                 "zero-attempt samples"
             )
         weights = np.empty(len(self), dtype=np.float64)
+        family_ids = getattr(
+            self, "sample_family_ids", self.correction_family_ids
+        )
         if self.balance_corrections_by_source_event:
-            correction_families = self.correction_family_ids[correction]
+            correction_families = family_ids[correction]
             unique_families, family_counts = np.unique(
                 correction_families, return_counts=True
             )
@@ -560,7 +605,23 @@ class UmiResidualDataset(BaseImageDataset):
             )
         else:
             weights[correction] = self.correction_fraction / correction_count
-        weights[zero] = (1.0 - self.correction_fraction) / zero_count
+        if getattr(self, "balance_zeros_by_source_event", False):
+            zero_families = family_ids[zero]
+            unique_families, family_counts = np.unique(
+                zero_families, return_counts=True
+            )
+            family_count_by_id = dict(zip(unique_families, family_counts))
+            weights[zero] = np.asarray(
+                [
+                    (1.0 - self.correction_fraction)
+                    / len(unique_families)
+                    / family_count_by_id[family_id]
+                    for family_id in zero_families
+                ],
+                dtype=np.float64,
+            )
+        else:
+            weights[zero] = (1.0 - self.correction_fraction) / zero_count
         return torch.from_numpy(weights)
 
     def get_residual_normalizer(self) -> SingleFieldLinearNormalizer:
@@ -644,7 +705,11 @@ class UmiResidualDataset(BaseImageDataset):
             "balance_corrections_by_source_event": (
                 self.balance_corrections_by_source_event
             ),
+            "balance_zeros_by_source_event": self.balance_zeros_by_source_event,
             "correction_family_count": int(
-                len(np.unique(self.correction_family_ids[self.labels == 1]))
+                len(np.unique(self.sample_family_ids[self.labels == 1]))
+            ),
+            "zero_family_count": int(
+                len(np.unique(self.sample_family_ids[self.labels == 0]))
             ),
         }

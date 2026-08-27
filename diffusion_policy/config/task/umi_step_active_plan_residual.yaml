@@ -1,0 +1,30 @@
+defaults:
+  - umi
+  - _self_
+
+name: umi_step_active_plan_residual
+residual_dataset_path: ${oc.env:RESIDUAL_DATASET_PATH,example_step_residual.zarr.zip}
+residual_horizon: ${oc.env:RESIDUAL_HORIZON,5}
+
+dataset:
+  _target_: diffusion_policy.dataset.umi_residual_dataset.UmiResidualDataset
+  dataset_path: ${task.residual_dataset_path}
+  shape_meta: ${task.shape_meta}
+  sample_mode: all                 # all | correction_only | zero_only
+  split: train
+  seed: 42
+  val_ratio: 0.15
+  val_episode_indices: null
+  expected_schema: superinference.step_active_plan_residual
+  expected_schema_version: 1
+  expected_action_alignment: step_active_plan_left_aligned
+  action_horizon: ${task.residual_horizon}
+  residual_scale_quantile: 0.995
+  residual_minimum_scale: 1.0e-4
+  correction_fraction: 0.5
+  # A dense event contributes several j-index windows. Give each source event
+  # one unit of mass, then divide it among its windows/resampled variants.
+  balance_corrections_by_source_event: true
+  balance_zeros_by_source_event: true
+  strict_recomposition_tolerance: 1.0e-5
+  return_metadata: false

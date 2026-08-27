@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -35,7 +35,9 @@ class ChunkResidualMLP(nn.Module):
     def __init__(
         self,
         obs_feature_dim: int,
-        action_horizon: int = 16,
+        action_horizon: Optional[int] = 16,
+        base_action_horizon: Optional[int] = None,
+        residual_horizon: Optional[int] = None,
         base_action_dim: int = 10,
         residual_action_dim: int = 7,
         obs_projection_dim: int = 256,
@@ -49,7 +51,26 @@ class ChunkResidualMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.obs_feature_dim = int(obs_feature_dim)
-        self.action_horizon = int(action_horizon)
+        if base_action_horizon is None:
+            if action_horizon is None:
+                raise ValueError(
+                    "base_action_horizon or action_horizon must be provided"
+                )
+            base_action_horizon = action_horizon
+        if residual_horizon is None:
+            if action_horizon is None:
+                raise ValueError(
+                    "residual_horizon or action_horizon must be provided"
+                )
+            residual_horizon = action_horizon
+        self.base_action_horizon = int(base_action_horizon)
+        self.residual_horizon = int(residual_horizon)
+        if self.base_action_horizon <= 0 or self.residual_horizon <= 0:
+            raise ValueError("action horizons must be positive")
+        # Historical V1/V2 code and checkpoints use action_horizon for the
+        # residual output horizon.  Keep that public attribute while allowing
+        # the active base window and predicted residual window to be explicit.
+        self.action_horizon = self.residual_horizon
         self.base_action_dim = int(base_action_dim)
         self.residual_action_dim = int(residual_action_dim)
         self.condition_on_base_action = bool(condition_on_base_action)
@@ -67,7 +88,9 @@ class ChunkResidualMLP(nn.Module):
         )
         trunk_input_dim = int(obs_projection_dim)
         if self.condition_on_base_action:
-            flattened_action_dim = self.action_horizon * self.base_action_dim
+            flattened_action_dim = (
+                self.base_action_horizon * self.base_action_dim
+            )
             self.base_chunk_encoder = nn.Sequential(
                 nn.LayerNorm(flattened_action_dim),
                 nn.Linear(flattened_action_dim, int(base_chunk_feature_dim)),
@@ -82,7 +105,7 @@ class ChunkResidualMLP(nn.Module):
         self.trunk = _mlp(trunk_input_dim, hidden_dims, dropout)
         last_dim = int(hidden_dims[-1])
         self.residual_head = nn.Linear(
-            last_dim, self.action_horizon * self.residual_action_dim
+            last_dim, self.residual_horizon * self.residual_action_dim
         )
         self.gate_head = nn.Linear(last_dim, 1) if self.gate_enabled else None
 
@@ -107,12 +130,12 @@ class ChunkResidualMLP(nn.Module):
                 f"(B, {self.obs_feature_dim}), got {tuple(obs_feature.shape)}"
             )
         if base_action.ndim != 3 or base_action.shape[1:] != (
-            self.action_horizon,
+            self.base_action_horizon,
             self.base_action_dim,
         ):
             raise ValueError(
                 "base_action must have shape "
-                f"(B, {self.action_horizon}, {self.base_action_dim}), got "
+                f"(B, {self.base_action_horizon}, {self.base_action_dim}), got "
                 f"{tuple(base_action.shape)}"
             )
         features = [self.obs_projection(obs_feature)]
@@ -122,7 +145,7 @@ class ChunkResidualMLP(nn.Module):
             )
         hidden = self.trunk(torch.cat(features, dim=-1))
         residual = self.residual_head(hidden).reshape(
-            -1, self.action_horizon, self.residual_action_dim
+            -1, self.residual_horizon, self.residual_action_dim
         )
         gate_logit = (
             self.gate_head(hidden).squeeze(-1)

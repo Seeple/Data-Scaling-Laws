@@ -69,6 +69,14 @@ class ChunkResidualPolicy(nn.Module):
         return self.model.action_horizon
 
     @property
+    def base_action_horizon(self) -> int:
+        return self.model.base_action_horizon
+
+    @property
+    def residual_horizon(self) -> int:
+        return self.model.residual_horizon
+
+    @property
     def residual_action_dim(self) -> int:
         return self.model.residual_action_dim
 

@@ -54,3 +54,21 @@ def test_masked_correction_zero_and_gate_loss_backpropagate():
     output["loss"].backward()
     assert model.residual_head.weight.grad is not None
     assert model.gate_head.weight.grad is not None
+
+
+def test_explicit_step_horizon_is_independent_of_frozen_dp_horizon():
+    model = ChunkResidualMLP(
+        obs_feature_dim=32,
+        action_horizon=None,
+        base_action_horizon=5,
+        residual_horizon=5,
+        gate_enabled=False,
+    )
+    policy = ChunkResidualPolicy(model)
+    policy.set_residual_normalizer(_identity_normalizer())
+    output = policy.predict_residual(
+        torch.randn(2, 32), torch.randn(2, 5, 10)
+    )
+    assert policy.base_action_horizon == 5
+    assert policy.residual_horizon == 5
+    assert output["residual"].shape == (2, 5, 7)

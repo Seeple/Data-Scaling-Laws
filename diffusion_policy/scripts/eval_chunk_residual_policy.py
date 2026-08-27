@@ -82,6 +82,19 @@ def evaluate(args: argparse.Namespace) -> dict:
     residual_policy, _ = load_residual_policy(
         args.residual_checkpoint, frozen.policy, device
     )
+    dataset_cfg = OmegaConf.to_container(cfg.task.dataset, resolve=True)
+    for key in (
+        "_target_",
+        "dataset_path",
+        "shape_meta",
+        "sample_mode",
+        "split",
+        "val_ratio",
+        "val_episode_indices",
+        "correction_fraction",
+        "return_metadata",
+    ):
+        dataset_cfg.pop(key, None)
     dataset = UmiResidualDataset(
         dataset_path=str(args.dataset),
         shape_meta=OmegaConf.to_container(cfg.shape_meta, resolve=True),
@@ -90,6 +103,7 @@ def evaluate(args: argparse.Namespace) -> dict:
         val_ratio=0.0,
         correction_fraction=None,
         return_metadata=True,
+        **dataset_cfg,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
