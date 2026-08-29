@@ -10,6 +10,7 @@ if __name__ == "__main__":
     sys.path.append(ROOT_DIR)
 
 import copy
+import dill
 import json
 import os
 import pathlib
@@ -32,7 +33,10 @@ from diffusion_policy.common.frozen_base_policy_loader import (
 )
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply
-from diffusion_policy.dataset.umi_residual_dataset import UmiResidualDataset
+from diffusion_policy.dataset.umi_residual_dataset import (
+    UmiResidualDataset,
+    UmiResidualDatasetCollection,
+)
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.residual.chunk_residual_mlp import ChunkResidualMLP
@@ -55,6 +59,8 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         "residual_valid_action_mask_layout",
         "residual_base_action_horizon",
         "residual_prediction_horizon",
+        "initial_residual_checkpoint",
+        "initial_residual_state_key",
     )
     exclude_keys = ("base_policy",)
 
@@ -119,6 +125,68 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         )
         self.global_step = 0
         self.epoch = 0
+        self.initial_residual_checkpoint = ""
+        self.initial_residual_state_key = ""
+
+    @staticmethod
+    def _load_pickled_metadata(payload: dict, key: str):
+        value = payload.get("pickles", {}).get(key)
+        return None if value is None else dill.loads(value)
+
+    def _initialize_from_residual_checkpoint(
+        self,
+        checkpoint_path: str,
+        state_key: str,
+        expected_alignment: str,
+    ) -> None:
+        """Warm-start model/EMA weights while keeping a fresh optimizer/epoch."""
+        path = pathlib.Path(checkpoint_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Initial residual checkpoint does not exist: {path}"
+            )
+        with path.open("rb") as stream:
+            payload = torch.load(
+                stream, map_location="cpu", pickle_module=dill
+            )
+        state_dicts = payload.get("state_dicts", {})
+        resolved_state_key = str(state_key)
+        if resolved_state_key == "auto":
+            resolved_state_key = (
+                "ema_model" if "ema_model" in state_dicts else "model"
+            )
+        if resolved_state_key not in state_dicts:
+            raise KeyError(
+                f"Initial residual checkpoint has no {resolved_state_key!r} state"
+            )
+        expected_hash = self._load_pickled_metadata(
+            payload, "base_checkpoint_sha256"
+        )
+        if expected_hash and expected_hash != self.base_checkpoint_sha256:
+            raise ValueError(
+                "Initial residual checkpoint uses a different frozen base "
+                f"policy: {expected_hash} != {self.base_checkpoint_sha256}"
+            )
+        checkpoint_alignment = self._load_pickled_metadata(
+            payload, "residual_action_alignment"
+        )
+        if (
+            checkpoint_alignment is not None
+            and str(checkpoint_alignment) != str(expected_alignment)
+        ):
+            raise ValueError(
+                "Initial residual checkpoint alignment mismatch: "
+                f"{checkpoint_alignment!r} != {expected_alignment!r}"
+            )
+        self.model.load_state_dict(
+            state_dicts[resolved_state_key], strict=True
+        )
+        if self.ema_model is not None:
+            self.ema_model.load_state_dict(
+                state_dicts[resolved_state_key], strict=True
+            )
+        self.initial_residual_checkpoint = str(path)
+        self.initial_residual_state_key = resolved_state_key
 
     def _encode_batch(
         self, batch: Dict[str, torch.Tensor]
@@ -174,6 +242,8 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
                 batch["residual_action"],
                 batch["valid_action_mask"],
                 batch["correction_label"],
+                batch.get("residual_supervision_label"),
+                batch.get("gate_target"),
             )
             loss_values.append(output["loss"].detach().reshape(1))
             correction_loss_values.append(
@@ -184,13 +254,16 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
 
             prediction = output["predicted_residual"]
             target = batch["residual_action"]
+            supervision_label = batch.get(
+                "residual_supervision_label", batch["correction_label"]
+            )
             correction_mask = (
                 batch["valid_action_mask"].bool()
-                & (batch["correction_label"] > 0.5)[:, None]
+                & (supervision_label > 0.5)[:, None]
             )
             zero_mask = (
                 torch.ones_like(batch["valid_action_mask"], dtype=torch.bool)
-                & (batch["correction_label"] <= 0.5)[:, None]
+                & (supervision_label <= 0.5)[:, None]
             )
             if correction_mask.any():
                 delta = prediction[correction_mask] - target[correction_mask]
@@ -213,7 +286,9 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
                 gate_probabilities.append(
                     output["gate_probability"].detach()
                 )
-                gate_labels.append(batch["correction_label"].detach())
+                gate_labels.append(
+                    batch.get("gate_target", supervision_label).detach()
+                )
 
         def gathered_mean(values, default=0.0):
             if not values:
@@ -298,14 +373,31 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
                 init_kwargs={"wandb": wandb_cfg},
             )
 
+        init_checkpoint = cfg.training.get(
+            "init_residual_checkpoint", None
+        )
+        if bool(cfg.training.resume) and init_checkpoint not in {
+            None,
+            "",
+            "null",
+        }:
+            raise ValueError(
+                "training.resume and init_residual_checkpoint are mutually "
+                "exclusive: resume restores optimizer/epoch state, whereas "
+                "a DAgger warm start intentionally creates a fresh run"
+            )
         if bool(cfg.training.resume):
             checkpoint = self.get_checkpoint_path()
             if checkpoint.is_file():
                 self.load_checkpoint(path=checkpoint)
 
         dataset = hydra.utils.instantiate(cfg.task.dataset)
-        if not isinstance(dataset, UmiResidualDataset):
-            raise TypeError("Residual workspace requires UmiResidualDataset")
+        if not isinstance(
+            dataset, (UmiResidualDataset, UmiResidualDatasetCollection)
+        ):
+            raise TypeError(
+                "Residual workspace requires a residual dataset or collection"
+            )
         self.residual_action_alignment = dataset.action_alignment
         self.residual_valid_action_mask_layout = (
             dataset.valid_action_mask_layout
@@ -342,6 +434,12 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
                 "verify its recorded base checkpoint manually. Newly "
                 "converted datasets enforce this automatically."
             )
+        if init_checkpoint not in {None, "", "null"}:
+            self._initialize_from_residual_checkpoint(
+                str(init_checkpoint),
+                str(cfg.training.get("init_residual_state_key", "auto")),
+                dataset.action_alignment,
+            )
         validation_dataset = dataset.get_validation_dataset()
         if accelerator.is_main_process:
             print(json.dumps(dataset.audit_summary(), indent=2))
@@ -370,8 +468,16 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         normalizer_path = os.path.join(
             self.output_dir, "residual_normalizer.pkl"
         )
+        use_initial_normalizer = bool(
+            self.initial_residual_checkpoint
+            and cfg.training.get("init_use_checkpoint_normalizer", True)
+        )
         if accelerator.is_main_process:
-            residual_normalizer = dataset.get_residual_normalizer()
+            residual_normalizer = (
+                copy.deepcopy(self.model.residual_normalizer)
+                if use_initial_normalizer
+                else dataset.get_residual_normalizer()
+            )
             with open(normalizer_path, "wb") as normalizer_file:
                 pickle.dump(residual_normalizer, normalizer_file)
         accelerator.wait_for_everyone()
@@ -470,6 +576,8 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
                                 batch["residual_action"],
                                 batch["valid_action_mask"],
                                 batch["correction_label"],
+                                batch.get("residual_supervision_label"),
+                                batch.get("gate_target"),
                             )
                             loss = output["loss"]
                         accelerator.backward(loss)

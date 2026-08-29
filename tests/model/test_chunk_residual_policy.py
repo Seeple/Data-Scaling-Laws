@@ -72,3 +72,22 @@ def test_explicit_step_horizon_is_independent_of_frozen_dp_horizon():
     assert policy.base_action_horizon == 5
     assert policy.residual_horizon == 5
     assert output["residual"].shape == (2, 5, 7)
+
+
+def test_nonhuman_rollout_target_can_supervise_residual_and_gate():
+    """Round-two rollout targets need not pose as human correction labels."""
+    model = ChunkResidualMLP(obs_feature_dim=32, gate_enabled=True)
+    policy = ChunkResidualPolicy(model)
+    policy.set_residual_normalizer(_identity_normalizer())
+    output = policy(
+        torch.zeros(1, 32),
+        torch.zeros(1, 16, 10),
+        torch.ones(1, 16, 7) * 0.1,
+        torch.ones(1, 16, dtype=torch.bool),
+        correction_label=torch.zeros(1),
+        residual_supervision_label=torch.ones(1),
+        gate_target=torch.ones(1),
+    )
+    assert output["correction_loss"] > 0
+    assert output["zero_loss"] == 0
+    assert output["gate_loss"] > 0

@@ -25,6 +25,7 @@ dataset:
   # A dense event contributes several j-index windows. Give each source event
   # one unit of mass, then divide it among its windows/resampled variants.
   balance_corrections_by_source_event: true
+  human_fraction_within_nonzero: null
   balance_zeros_by_source_event: true
   strict_recomposition_tolerance: 1.0e-5
   return_metadata: false

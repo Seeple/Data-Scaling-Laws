@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import bisect
 import os
 from pathlib import Path
 from typing import Dict, Optional, Sequence
@@ -69,6 +70,7 @@ class UmiResidualDataset(BaseImageDataset):
         correction_fraction: Optional[float] = 0.5,
         balance_corrections_by_source_event: bool = True,
         balance_zeros_by_source_event: bool = False,
+        human_fraction_within_nonzero: Optional[float] = None,
         strict_recomposition_tolerance: float = 1e-5,
         return_metadata: bool = False,
         **_unused_umi_dataset_kwargs,
@@ -108,14 +110,26 @@ class UmiResidualDataset(BaseImageDataset):
         self.balance_zeros_by_source_event = bool(
             balance_zeros_by_source_event
         )
+        self.human_fraction_within_nonzero = (
+            None
+            if human_fraction_within_nonzero is None
+            else float(human_fraction_within_nonzero)
+        )
         self.strict_recomposition_tolerance = float(
             strict_recomposition_tolerance
         )
         self.return_metadata = bool(return_metadata)
 
-        if self.sample_mode not in {"all", "correction_only", "zero_only"}:
+        if self.sample_mode not in {
+            "all",
+            "correction_only",
+            "human_correction_only",
+            "accepted_rollout_only",
+            "zero_only",
+            "nonzero_only",
+        }:
             raise ValueError(
-                "sample_mode must be all, correction_only or zero_only"
+                "Unsupported residual sample_mode"
             )
         if self.split not in {"train", "val", "all"}:
             raise ValueError("split must be train, val or all")
@@ -125,6 +139,12 @@ class UmiResidualDataset(BaseImageDataset):
             0 < self.correction_fraction < 1
         ):
             raise ValueError("correction_fraction must be in (0, 1)")
+        if self.human_fraction_within_nonzero is not None and not (
+            0 < self.human_fraction_within_nonzero < 1
+        ):
+            raise ValueError(
+                "human_fraction_within_nonzero must be in (0, 1)"
+            )
         if not Path(self.dataset_path).is_file():
             raise FileNotFoundError(
                 f"Residual Zarr does not exist: {self.dataset_path}"
@@ -282,16 +302,57 @@ class UmiResidualDataset(BaseImageDataset):
         if int(self.shape_meta["action"]["shape"][0]) != BASE_ACTION_DIM:
             raise ValueError("Base UMI action shape must be 10-D")
 
-        labels = np.asarray(self._data["correction_label"][:], dtype=np.uint8)
+        correction_labels = np.asarray(
+            self._data["correction_label"][:], dtype=np.uint8
+        )
+        supervision_labels = np.asarray(
+            self._data[
+                "residual_supervision_label"
+                if "residual_supervision_label" in self._data
+                else "correction_label"
+            ][:],
+            dtype=np.uint8,
+        )
+        gate_targets = np.asarray(
+            self._data[
+                "gate_target"
+                if "gate_target" in self._data
+                else "correction_label"
+            ][:],
+            dtype=np.uint8,
+        )
+        target_kinds = np.asarray(
+            self._data["target_kind"][:]
+            if "target_kind" in self._data
+            else correction_labels,
+            dtype=np.uint8,
+        )
         episode_ids = np.asarray(
             self._data["source_episode_index"][:], dtype=np.int64
         )
-        if labels.shape != (sample_count,) or episode_ids.shape != (
-            sample_count,
+        label_arrays = (
+            correction_labels,
+            supervision_labels,
+            gate_targets,
+            target_kinds,
+        )
+        if any(value.shape != (sample_count,) for value in label_arrays) or (
+            episode_ids.shape != (sample_count,)
         ):
             raise ValueError("Residual labels/episode indices have invalid shape")
-        if not set(np.unique(labels)).issubset({0, 1}):
-            raise ValueError("correction_label must be binary")
+        for name, values in {
+            "correction_label": correction_labels,
+            "residual_supervision_label": supervision_labels,
+            "gate_target": gate_targets,
+        }.items():
+            if not set(np.unique(values)).issubset({0, 1}):
+                raise ValueError(f"{name} must be binary")
+        if not set(np.unique(target_kinds)).issubset({0, 1, 2}):
+            raise ValueError("target_kind must contain only 0, 1 or 2")
+        if np.any(correction_labels > supervision_labels):
+            raise ValueError(
+                "Every human correction must have nonzero residual supervision"
+            )
 
         unique_episodes = np.unique(episode_ids)
         if self.val_episode_indices is not None:
@@ -319,9 +380,15 @@ class UmiResidualDataset(BaseImageDataset):
 
         label_mask = np.ones(sample_count, dtype=bool)
         if self.sample_mode == "correction_only":
-            label_mask = labels == 1
+            label_mask = supervision_labels == 1
+        elif self.sample_mode == "human_correction_only":
+            label_mask = correction_labels == 1
+        elif self.sample_mode == "accepted_rollout_only":
+            label_mask = target_kinds == 2
         elif self.sample_mode == "zero_only":
-            label_mask = labels == 0
+            label_mask = supervision_labels == 0
+        elif self.sample_mode == "nonzero_only":
+            label_mask = supervision_labels == 1
         self.indices = np.flatnonzero(split_mask & label_mask).astype(np.int64)
         if self.split != "val" and len(self.indices) == 0:
             raise ValueError(
@@ -329,7 +396,14 @@ class UmiResidualDataset(BaseImageDataset):
                 f"sample_mode={self.sample_mode}"
             )
 
-        self.labels = labels[self.indices]
+        # ``labels`` remains the balancing label used by existing samplers.
+        # For schema-v1 datasets it is identical to correction_label; for
+        # second-round data it also includes accepted nonzero rollout targets.
+        self.labels = supervision_labels[self.indices]
+        self.correction_labels = correction_labels[self.indices]
+        self.supervision_labels = supervision_labels[self.indices]
+        self.gate_targets = gate_targets[self.indices]
+        self.target_kinds = target_kinds[self.indices]
         self.episode_ids = episode_ids[self.indices]
         if "source_event_index" in self._data:
             all_family_ids = np.asarray(
@@ -518,6 +592,32 @@ class UmiResidualDataset(BaseImageDataset):
                 int(self._load_array("correction_label", source_index)),
                 dtype=torch.float32,
             ),
+            "residual_supervision_label": torch.tensor(
+                int(
+                    self._load_array(
+                        "residual_supervision_label", source_index
+                    )
+                    if "residual_supervision_label" in self._data
+                    else self._load_array("correction_label", source_index)
+                ),
+                dtype=torch.float32,
+            ),
+            "gate_target": torch.tensor(
+                int(
+                    self._load_array("gate_target", source_index)
+                    if "gate_target" in self._data
+                    else self._load_array("correction_label", source_index)
+                ),
+                dtype=torch.float32,
+            ),
+            "target_kind": torch.tensor(
+                int(
+                    self._load_array("target_kind", source_index)
+                    if "target_kind" in self._data
+                    else self._load_array("correction_label", source_index)
+                ),
+                dtype=torch.int64,
+            ),
         }
         if self.return_metadata:
             sample.update(
@@ -566,6 +666,9 @@ class UmiResidualDataset(BaseImageDataset):
                 self.balance_corrections_by_source_event
             ),
             balance_zeros_by_source_event=self.balance_zeros_by_source_event,
+            human_fraction_within_nonzero=(
+                self.human_fraction_within_nonzero
+            ),
             strict_recomposition_tolerance=self.strict_recomposition_tolerance,
             return_metadata=self.return_metadata,
         )
@@ -587,6 +690,46 @@ class UmiResidualDataset(BaseImageDataset):
         family_ids = getattr(
             self, "sample_family_ids", self.correction_family_ids
         )
+        human_fraction_within_nonzero = getattr(
+            self, "human_fraction_within_nonzero", None
+        )
+        if human_fraction_within_nonzero is not None:
+            human = self.target_kinds == 1
+            accepted = self.target_kinds == 2
+            if not np.any(human) or not np.any(accepted):
+                raise ValueError(
+                    "Three-way balancing requires both human-correction and "
+                    "accepted-rollout targets"
+                )
+
+            def assign_family_mass(mask: np.ndarray, mass: float) -> None:
+                selected_families = family_ids[mask]
+                unique_families, family_counts = np.unique(
+                    selected_families, return_counts=True
+                )
+                count_by_id = dict(zip(unique_families, family_counts))
+                weights[mask] = np.asarray(
+                    [
+                        mass / len(unique_families) / count_by_id[family_id]
+                        for family_id in selected_families
+                    ],
+                    dtype=np.float64,
+                )
+
+            human_mass = (
+                self.correction_fraction
+                * human_fraction_within_nonzero
+            )
+            accepted_mass = self.correction_fraction - human_mass
+            assign_family_mass(human, human_mass)
+            assign_family_mass(accepted, accepted_mass)
+            if self.balance_zeros_by_source_event:
+                assign_family_mass(zero, 1.0 - self.correction_fraction)
+            else:
+                weights[zero] = (
+                    1.0 - self.correction_fraction
+                ) / zero_count
+            return torch.from_numpy(weights)
         if self.balance_corrections_by_source_event:
             correction_families = family_ids[correction]
             unique_families, family_counts = np.unique(
@@ -626,6 +769,20 @@ class UmiResidualDataset(BaseImageDataset):
 
     def get_residual_normalizer(self) -> SingleFieldLinearNormalizer:
         """Fit a zero-preserving normalizer on valid correction tokens only."""
+        valid_residual = self.get_valid_supervised_residual()
+        scale, stats = fit_zero_centered_scale(
+            valid_residual,
+            quantile=self.residual_scale_quantile,
+            minimum_scale=self.residual_minimum_scale,
+        )
+        return SingleFieldLinearNormalizer.create_manual(
+            scale=scale,
+            offset=np.zeros(RESIDUAL_ACTION_DIM, dtype=np.float32),
+            input_stats_dict=stats,
+        )
+
+    def get_valid_supervised_residual(self) -> np.ndarray:
+        """Return valid nonzero-target tokens for collection normalization."""
         self._ensure_open()
         correction_indices = self.indices[self.labels == 1]
         if len(correction_indices) == 0:
@@ -654,17 +811,7 @@ class UmiResidualDataset(BaseImageDataset):
             self._data["valid_action_mask"].oindex[correction_indices],
             dtype=bool,
         )
-        valid_residual = residual[masks]
-        scale, stats = fit_zero_centered_scale(
-            valid_residual,
-            quantile=self.residual_scale_quantile,
-            minimum_scale=self.residual_minimum_scale,
-        )
-        return SingleFieldLinearNormalizer.create_manual(
-            scale=scale,
-            offset=np.zeros(RESIDUAL_ACTION_DIM, dtype=np.float32),
-            input_stats_dict=stats,
-        )
+        return residual[masks]
 
     def get_all_actions(self) -> torch.Tensor:
         actions = [self[index]["residual_action"] for index in range(len(self))]
@@ -690,6 +837,12 @@ class UmiResidualDataset(BaseImageDataset):
             "sample_count": len(self),
             "correction_count": int(np.count_nonzero(self.labels == 1)),
             "zero_count": int(np.count_nonzero(self.labels == 0)),
+            "human_correction_count": int(
+                np.count_nonzero(self.correction_labels == 1)
+            ),
+            "accepted_rollout_count": int(
+                np.count_nonzero(self.target_kinds == 2)
+            ),
             "episode_count": int(len(np.unique(self.episode_ids))),
             "validation_episode_indices": list(
                 self.validation_episode_indices
@@ -706,10 +859,215 @@ class UmiResidualDataset(BaseImageDataset):
                 self.balance_corrections_by_source_event
             ),
             "balance_zeros_by_source_event": self.balance_zeros_by_source_event,
+            "human_fraction_within_nonzero": (
+                self.human_fraction_within_nonzero
+            ),
             "correction_family_count": int(
                 len(np.unique(self.sample_family_ids[self.labels == 1]))
             ),
             "zero_family_count": int(
                 len(np.unique(self.sample_family_ids[self.labels == 0]))
             ),
+        }
+
+
+class UmiResidualDatasetCollection(BaseImageDataset):
+    """A replay mixture of compatible residual Zarr datasets.
+
+    Each child keeps an episode-level train/validation split. Sampling mass is
+    first balanced within a child using ``UmiResidualDataset`` and then split
+    across rounds with ``dataset_mixture_weights``. This prevents a larger D2
+    recording from silently erasing D1 solely because it contains more rows.
+    """
+
+    def __init__(
+        self,
+        dataset_paths: Sequence[str],
+        shape_meta: dict,
+        dataset_mixture_weights: Optional[Sequence[float]] = None,
+        val_episode_indices_by_dataset: Optional[
+            Sequence[Optional[Sequence[int]]]
+        ] = None,
+        dataset_path: Optional[str] = None,
+        split: str = "train",
+        **dataset_kwargs,
+    ) -> None:
+        super().__init__()
+        del dataset_path  # inherited config key; collection uses dataset_paths
+        if isinstance(dataset_paths, str):
+            raise TypeError(
+                "dataset_paths must be a Hydra/Python list, not one string"
+            )
+        self.dataset_paths = [str(Path(path).expanduser()) for path in dataset_paths]
+        if not self.dataset_paths:
+            raise ValueError("dataset_paths must contain at least one Zarr")
+        self.shape_meta = copy.deepcopy(shape_meta)
+        self.split = str(split)
+
+        if val_episode_indices_by_dataset is not None and len(
+            val_episode_indices_by_dataset
+        ) != len(self.dataset_paths):
+            raise ValueError(
+                "val_episode_indices_by_dataset must match dataset_paths"
+            )
+        child_val_indices = (
+            list(val_episode_indices_by_dataset)
+            if val_episode_indices_by_dataset is not None
+            else [None] * len(self.dataset_paths)
+        )
+        # A single inherited explicit list is ambiguous across rounds; require
+        # the per-dataset form instead.
+        inherited_val = dataset_kwargs.pop("val_episode_indices", None)
+        if inherited_val is not None and val_episode_indices_by_dataset is None:
+            raise ValueError(
+                "Residual collections require val_episode_indices_by_dataset"
+            )
+        self._dataset_kwargs = copy.deepcopy(dataset_kwargs)
+        self.datasets = [
+            UmiResidualDataset(
+                dataset_path=path,
+                shape_meta=self.shape_meta,
+                split=self.split,
+                val_episode_indices=child_val_indices[index],
+                **dataset_kwargs,
+            )
+            for index, path in enumerate(self.dataset_paths)
+        ]
+        if any(len(dataset) == 0 for dataset in self.datasets):
+            raise ValueError("Every residual replay dataset must be non-empty")
+
+        first = self.datasets[0]
+        compatible_fields = (
+            "action_alignment",
+            "valid_action_mask_layout",
+            "action_horizon",
+            "observation_horizon",
+            "recorded_base_checkpoint_sha256",
+        )
+        for dataset in self.datasets[1:]:
+            for field in compatible_fields:
+                if getattr(dataset, field) != getattr(first, field):
+                    raise ValueError(
+                        f"Residual replay datasets disagree on {field}: "
+                        f"{getattr(first, field)!r} != {getattr(dataset, field)!r}"
+                    )
+        self.action_alignment = first.action_alignment
+        self.valid_action_mask_layout = first.valid_action_mask_layout
+        self.action_horizon = first.action_horizon
+        self.observation_horizon = first.observation_horizon
+        self.recorded_base_checkpoint = first.recorded_base_checkpoint
+        self.recorded_base_policy_class = first.recorded_base_policy_class
+        self.recorded_base_checkpoint_sha256 = (
+            first.recorded_base_checkpoint_sha256
+        )
+        self.sample_mode = first.sample_mode
+        self.residual_scale_quantile = first.residual_scale_quantile
+        self.residual_minimum_scale = first.residual_minimum_scale
+        self.validation_episode_indices_by_dataset = tuple(
+            dataset.validation_episode_indices for dataset in self.datasets
+        )
+        self.validation_episode_indices = (
+            self.validation_episode_indices_by_dataset
+        )
+
+        if dataset_mixture_weights is None:
+            mixture = np.ones(len(self.datasets), dtype=np.float64)
+        else:
+            mixture = np.asarray(dataset_mixture_weights, dtype=np.float64)
+        if mixture.shape != (len(self.datasets),) or np.any(mixture <= 0):
+            raise ValueError(
+                "dataset_mixture_weights must be one positive value per dataset"
+            )
+        self.dataset_mixture_weights = mixture / mixture.sum()
+        lengths = [len(dataset) for dataset in self.datasets]
+        self._cumulative_lengths = np.cumsum(lengths).tolist()
+        self.labels = np.concatenate([dataset.labels for dataset in self.datasets])
+        self.correction_labels = np.concatenate(
+            [dataset.correction_labels for dataset in self.datasets]
+        )
+        self.supervision_labels = np.concatenate(
+            [dataset.supervision_labels for dataset in self.datasets]
+        )
+        self.gate_targets = np.concatenate(
+            [dataset.gate_targets for dataset in self.datasets]
+        )
+        self.target_kinds = np.concatenate(
+            [dataset.target_kinds for dataset in self.datasets]
+        )
+
+    def __len__(self) -> int:
+        return int(self._cumulative_lengths[-1])
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        dataset_index = bisect.bisect_right(self._cumulative_lengths, index)
+        previous = 0 if dataset_index == 0 else self._cumulative_lengths[dataset_index - 1]
+        return self.datasets[dataset_index][index - previous]
+
+    def get_validation_dataset(self) -> "UmiResidualDatasetCollection":
+        return UmiResidualDatasetCollection(
+            dataset_paths=self.dataset_paths,
+            shape_meta=self.shape_meta,
+            dataset_mixture_weights=self.dataset_mixture_weights.tolist(),
+            val_episode_indices_by_dataset=(
+                self.validation_episode_indices_by_dataset
+            ),
+            split="val",
+            **self._dataset_kwargs,
+        )
+
+    def get_sampling_weights(self) -> torch.Tensor:
+        weights = []
+        for mixture_weight, dataset in zip(
+            self.dataset_mixture_weights, self.datasets
+        ):
+            child = dataset.get_sampling_weights()
+            if child is None:
+                child = torch.full(
+                    (len(dataset),), 1.0 / len(dataset), dtype=torch.float64
+                )
+            else:
+                child = child.to(dtype=torch.float64)
+                child = child / child.sum()
+            weights.append(child * float(mixture_weight))
+        return torch.cat(weights)
+
+    def get_residual_normalizer(self) -> SingleFieldLinearNormalizer:
+        residual = np.concatenate(
+            [dataset.get_valid_supervised_residual() for dataset in self.datasets],
+            axis=0,
+        )
+        scale, stats = fit_zero_centered_scale(
+            residual,
+            quantile=self.residual_scale_quantile,
+            minimum_scale=self.residual_minimum_scale,
+        )
+        return SingleFieldLinearNormalizer.create_manual(
+            scale=scale,
+            offset=np.zeros(RESIDUAL_ACTION_DIM, dtype=np.float32),
+            input_stats_dict=stats,
+        )
+
+    def audit_summary(self) -> Dict[str, object]:
+        return {
+            "dataset_paths": self.dataset_paths,
+            "dataset_mixture_weights": self.dataset_mixture_weights.tolist(),
+            "split": self.split,
+            "sample_count": len(self),
+            "nonzero_supervision_count": int(np.count_nonzero(self.labels)),
+            "human_correction_count": int(
+                np.count_nonzero(self.correction_labels)
+            ),
+            "accepted_rollout_count": int(
+                np.count_nonzero(self.target_kinds == 2)
+            ),
+            "validation_episode_indices_by_dataset": [
+                list(values)
+                for values in self.validation_episode_indices_by_dataset
+            ],
+            "action_alignment": self.action_alignment,
+            "children": [dataset.audit_summary() for dataset in self.datasets],
         }

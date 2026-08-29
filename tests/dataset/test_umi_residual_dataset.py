@@ -5,7 +5,10 @@ import zarr
 from scipy.spatial.transform import Rotation
 
 from diffusion_policy.common.residual_action_util import compute_world_frame_residual
-from diffusion_policy.dataset.umi_residual_dataset import UmiResidualDataset
+from diffusion_policy.dataset.umi_residual_dataset import (
+    UmiResidualDataset,
+    UmiResidualDatasetCollection,
+)
 
 
 def _shape_meta():
@@ -22,7 +25,11 @@ def _shape_meta():
     return {"obs": obs, "action": {"shape": [10], "horizon": 16}}
 
 
-def _write_dataset(path: Path, active_suffix: bool = False):
+def _write_dataset(
+    path: Path,
+    active_suffix: bool = False,
+    second_round: bool = False,
+):
     sample_count, horizon = 4, 16
     base = np.zeros((sample_count, horizon, 8), dtype=np.float32)
     base[..., :3] = [0.4, 0.0, 0.3]
@@ -36,6 +43,8 @@ def _write_dataset(path: Path, active_suffix: bool = False):
     masks[2, :6] = 0
     edited[0, 4:, 0] += 0.01
     edited[2, 6:, 1] -= 0.02
+    if second_round:
+        edited[1, :, 2] += 0.005
     if active_suffix:
         masks[0] = 0
         masks[0, :12] = 1
@@ -73,6 +82,18 @@ def _write_dataset(path: Path, active_suffix: bool = False):
         "correction_label": labels,
         "source_episode_index": np.array([0, 0, 1, 1], dtype=np.int64),
     }
+    if second_round:
+        arrays.update(
+            {
+                # Row 1 is an accepted base->rollout target. It is not a
+                # human edit, but must be optimized as nonzero supervision.
+                "residual_supervision_label": np.array(
+                    [1, 1, 1, 0], dtype=np.uint8
+                ),
+                "gate_target": np.array([1, 1, 1, 0], dtype=np.uint8),
+                "target_kind": np.array([1, 2, 1, 0], dtype=np.uint8),
+            }
+        )
     for key, value in arrays.items():
         data.create_dataset(key, data=value, chunks=(1,) + value.shape[1:])
     root.attrs.update(
@@ -225,3 +246,41 @@ def test_step_active_dataset_uses_explicit_horizon_and_family_balance(tmp_path):
         dataset.get_sampling_weights().numpy(),
         [0.125, 0.125, 0.25, 0.25, 0.25],
     )
+
+
+def test_second_round_labels_keep_human_and_accepted_targets_distinct(tmp_path):
+    path = tmp_path / "round2.zarr.zip"
+    _write_dataset(path, second_round=True)
+    dataset = UmiResidualDataset(
+        dataset_path=str(path),
+        shape_meta=_shape_meta(),
+        sample_mode="all",
+        split="all",
+        val_ratio=0.0,
+        correction_fraction=0.5,
+        human_fraction_within_nonzero=0.5,
+    )
+    assert dataset.correction_labels.tolist() == [1, 0, 1, 0]
+    assert dataset.supervision_labels.tolist() == [1, 1, 1, 0]
+    assert dataset.gate_targets.tolist() == [1, 1, 1, 0]
+    assert dataset.target_kinds.tolist() == [1, 2, 1, 0]
+    np.testing.assert_allclose(dataset.get_sampling_weights().sum(), 1.0)
+
+
+def test_residual_collection_assigns_explicit_mass_to_each_round(tmp_path):
+    first = tmp_path / "round1.zarr.zip"
+    second = tmp_path / "round2.zarr.zip"
+    _write_dataset(first)
+    _write_dataset(second)
+    collection = UmiResidualDatasetCollection(
+        dataset_paths=[str(first), str(second)],
+        dataset_mixture_weights=[0.25, 0.75],
+        shape_meta=_shape_meta(),
+        sample_mode="all",
+        split="all",
+        val_ratio=0.0,
+        correction_fraction=0.5,
+    )
+    weights = collection.get_sampling_weights().numpy()
+    np.testing.assert_allclose(weights[:4].sum(), 0.25)
+    np.testing.assert_allclose(weights[4:].sum(), 0.75)

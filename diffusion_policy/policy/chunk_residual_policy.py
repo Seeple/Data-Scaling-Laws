@@ -102,6 +102,8 @@ class ChunkResidualPolicy(nn.Module):
         residual_action: torch.Tensor,
         valid_action_mask: torch.Tensor,
         correction_label: torch.Tensor,
+        residual_supervision_label: torch.Tensor | None = None,
+        gate_target: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         prediction = self.model(obs_feature, normalized_base_action)
         predicted_normalized = prediction["residual"]
@@ -109,6 +111,18 @@ class ChunkResidualPolicy(nn.Module):
         valid_action_mask = valid_action_mask.to(dtype=torch.bool)
         correction_label = correction_label.reshape(-1).to(
             dtype=predicted_normalized.dtype
+        )
+        supervision_label = (
+            correction_label
+            if residual_supervision_label is None
+            else residual_supervision_label.reshape(-1).to(
+                dtype=predicted_normalized.dtype
+            )
+        )
+        resolved_gate_target = (
+            supervision_label
+            if gate_target is None
+            else gate_target.reshape(-1).to(dtype=predicted_normalized.dtype)
         )
         if valid_action_mask.shape != predicted_normalized.shape[:2]:
             raise ValueError(
@@ -118,6 +132,10 @@ class ChunkResidualPolicy(nn.Module):
             )
         if correction_label.shape[0] != predicted_normalized.shape[0]:
             raise ValueError("correction_label batch dimension mismatch")
+        if supervision_label.shape != correction_label.shape:
+            raise ValueError("residual_supervision_label shape mismatch")
+        if resolved_gate_target.shape != correction_label.shape:
+            raise ValueError("gate_target shape mismatch")
 
         element_loss = F.huber_loss(
             predicted_normalized,
@@ -125,7 +143,7 @@ class ChunkResidualPolicy(nn.Module):
             reduction="none",
             delta=self.huber_delta,
         )
-        correction_rows = correction_label > 0.5
+        correction_rows = supervision_label > 0.5
         zero_rows = ~correction_rows
         correction_mask = valid_action_mask & correction_rows[:, None]
         zero_mask = torch.ones_like(valid_action_mask) & zero_rows[:, None]
@@ -156,7 +174,7 @@ class ChunkResidualPolicy(nn.Module):
         gate_logit = prediction["gate_logit"]
         if gate_logit is not None:
             gate_loss = F.binary_cross_entropy_with_logits(
-                gate_logit, correction_label
+                gate_logit, resolved_gate_target
             )
             gate_probability = torch.sigmoid(gate_logit)
         else:
@@ -232,6 +250,8 @@ class ChunkResidualPolicy(nn.Module):
         residual_action: torch.Tensor | None = None,
         valid_action_mask: torch.Tensor | None = None,
         correction_label: torch.Tensor | None = None,
+        residual_supervision_label: torch.Tensor | None = None,
+        gate_target: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         if residual_action is not None:
             if valid_action_mask is None or correction_label is None:
@@ -245,5 +265,7 @@ class ChunkResidualPolicy(nn.Module):
                 residual_action=residual_action,
                 valid_action_mask=valid_action_mask,
                 correction_label=correction_label,
+                residual_supervision_label=residual_supervision_label,
+                gate_target=gate_target,
             )
         return self.predict_residual(obs_feature, normalized_base_action)

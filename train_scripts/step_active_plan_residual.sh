@@ -41,6 +41,13 @@ ENCODER_MODE="${ENCODER_MODE:-eval}"
 CONDITION_ON_BASE_ACTION="${CONDITION_ON_BASE_ACTION:-true}"
 CORRECTION_LOSS_WEIGHT="${CORRECTION_LOSS_WEIGHT:-1.0}"
 GATE_LOSS_WEIGHT="${GATE_LOSS_WEIGHT:-1.0}"
+REPLAY_RESIDUAL_DATASET_PATH="${REPLAY_RESIDUAL_DATASET_PATH:-}"
+DATASET_MIXTURE_WEIGHTS="${DATASET_MIXTURE_WEIGHTS:-[0.5,0.5]}"
+VAL_EPISODE_INDICES_BY_DATASET="${VAL_EPISODE_INDICES_BY_DATASET:-null}"
+INIT_RESIDUAL_CKPT="${INIT_RESIDUAL_CKPT:-}"
+INIT_RESIDUAL_STATE_KEY="${INIT_RESIDUAL_STATE_KEY:-auto}"
+INIT_USE_CHECKPOINT_NORMALIZER="${INIT_USE_CHECKPOINT_NORMALIZER:-true}"
+HUMAN_FRACTION_WITHIN_NONZERO="${HUMAN_FRACTION_WITHIN_NONZERO:-null}"
 
 if [ "${RESIDUAL_HORIZON}" != "1" ] && [ "${RESIDUAL_HORIZON}" != "5" ]; then
   echo "RESIDUAL_HORIZON must be 1 or 5" >&2
@@ -90,6 +97,25 @@ export BASE_POLICY_CKPT RESIDUAL_DATASET_PATH RESIDUAL_HORIZON
 export HYDRA_FULL_ERROR=1
 export PYTHONFAULTHANDLER=1
 
+ROUND2_ARGS=()
+DATASET_VAL_EPISODE_INDICES="${VAL_EPISODE_INDICES}"
+if [ -n "${REPLAY_RESIDUAL_DATASET_PATH}" ]; then
+  DATASET_VAL_EPISODE_INDICES="null"
+  ROUND2_ARGS+=(
+    'task.dataset._target_=diffusion_policy.dataset.umi_residual_dataset.UmiResidualDatasetCollection'
+    "+task.dataset.dataset_paths=[${REPLAY_RESIDUAL_DATASET_PATH},${RESIDUAL_DATASET_PATH}]"
+    "+task.dataset.dataset_mixture_weights=${DATASET_MIXTURE_WEIGHTS}"
+    "+task.dataset.val_episode_indices_by_dataset=${VAL_EPISODE_INDICES_BY_DATASET}"
+  )
+fi
+if [ -n "${INIT_RESIDUAL_CKPT}" ]; then
+  ROUND2_ARGS+=(
+    "training.init_residual_checkpoint=${INIT_RESIDUAL_CKPT}"
+    "training.init_residual_state_key=${INIT_RESIDUAL_STATE_KEY}"
+    "training.init_use_checkpoint_normalizer=${INIT_USE_CHECKPOINT_NORMALIZER}"
+  )
+fi
+
 accelerate launch \
   --main_process_port "${MAIN_PROCESS_PORT}" \
   --config_file "${ACCELERATE_CONFIG_FILE}" \
@@ -97,11 +123,13 @@ accelerate launch \
   --mixed_precision "${MIXED_PRECISION}" \
   ../train.py \
   --config-name=train_step_active_plan_residual_mlp_workspace \
+  "${ROUND2_ARGS[@]}" \
   hydra.run.dir="${run_dir}" \
   task.dataset.sample_mode="${SAMPLE_MODE}" \
   task.dataset.correction_fraction="${CORRECTION_FRACTION_ARG}" \
   task.dataset.val_ratio="${VAL_RATIO}" \
-  task.dataset.val_episode_indices="${VAL_EPISODE_INDICES}" \
+  task.dataset.val_episode_indices="${DATASET_VAL_EPISODE_INDICES}" \
+  task.dataset.human_fraction_within_nonzero="${HUMAN_FRACTION_WITHIN_NONZERO}" \
   policy.model.gate_enabled="${GATE_ENABLED}" \
   policy.model.condition_on_base_action="${CONDITION_ON_BASE_ACTION}" \
   policy.zero_loss_weight="${ZERO_LOSS_WEIGHT}" \

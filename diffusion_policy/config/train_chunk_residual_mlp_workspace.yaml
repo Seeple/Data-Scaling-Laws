@@ -74,6 +74,11 @@ training:
   seed: 42
   debug: false
   resume: false
+  # Optional second-round warm start. Only policy/EMA weights are loaded;
+  # optimizer, scheduler, epoch and global step start fresh.
+  init_residual_checkpoint: null
+  init_residual_state_key: auto
+  init_use_checkpoint_normalizer: true
   num_epochs: 200
   lr_scheduler: cosine
   lr_warmup_steps: 100

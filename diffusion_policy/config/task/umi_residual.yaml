@@ -24,5 +24,8 @@ dataset:
   # A correction and all accepted multi-base variants share the same total
   # sampling mass, so easy-to-resample events do not dominate the dataset.
   balance_corrections_by_source_event: true
+  # Optional three-way mixture inside the nonzero half: human edits versus
+  # accepted residual-rollout distillation targets. Null preserves V1/V2.
+  human_fraction_within_nonzero: null
   strict_recomposition_tolerance: 1.0e-5
   return_metadata: false
