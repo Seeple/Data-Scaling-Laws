@@ -3,10 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.common.loss_utils import reduce_action_loss
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
@@ -192,8 +192,17 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
                 )
             else:
                 action_valid_mask = None
+            if "action_loss_weight" in batch:
+                action_loss_weight = torch.repeat_interleave(
+                    batch["action_loss_weight"],
+                    repeats=self.train_diffusion_n_samples,
+                    dim=0,
+                )
+            else:
+                action_loss_weight = None
         else:
             action_valid_mask = batch.get("action_valid_mask", None)
+            action_loss_weight = batch.get("action_loss_weight", None)
 
         trajectory = nactions
         # Sample noise that we'll add to the images
@@ -231,16 +240,11 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
 
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss.type(loss.dtype)
-        if action_valid_mask is not None:
-            action_valid_mask = action_valid_mask.to(device=loss.device, dtype=loss.dtype)
-            while action_valid_mask.ndim < loss.ndim:
-                action_valid_mask = action_valid_mask.unsqueeze(-1)
-            loss = loss * action_valid_mask
-            denom = action_valid_mask.expand_as(loss).sum().clamp(min=1.0)
-            loss = loss.sum() / denom
-        else:
-            loss = reduce(loss, 'b ... -> b (...)', 'mean')
-            loss = loss.mean()
+        loss = reduce_action_loss(
+            elementwise_loss=loss,
+            action_valid_mask=action_valid_mask,
+            action_loss_weight=action_loss_weight,
+        )
 
         return loss
 

@@ -189,6 +189,24 @@ task:
     hitl_skip_rising_edge: False
     hitl_skip_rising_edge_steps: 5
     hitl_treat_segments_as_episodes: False
+    # Sirius-style intervention-aware weighted finetuning. All switches are
+    # opt-in so the historical correction-only DAgger pipeline is unchanged.
+    # This mode needs complete online rollouts and is incompatible with the
+    # hitl-only filters/action masks above.
+    sirius_weighting_enabled: False
+    sirius_source_fps: 15.0
+    sirius_target_intervention_fraction: 0.5
+    sirius_target_pre_intervention_fraction: 0.0
+    sirius_pre_intervention_seconds: 1.0
+    # Debounce tag flicker independently inside each episode before detecting
+    # intervention rising edges. Every modification is printed during startup.
+    sirius_tag_debounce_enabled: True
+    sirius_merge_policy_gaps_seconds: 0.5
+    sirius_min_intervention_seconds: 0.3
+    # null keeps exact importance weights. Set a positive value only for a
+    # clipping ablation, since clipping changes the achieved target mass.
+    sirius_max_importance_weight: null
+    sirius_log_class_stats: True
     # Keep action normalization fixed to offline expert (teleop) distribution by default.
     # Set to "mixed" for ablation/backward-compatible behavior.
     action_normalizer_source: teleop
