@@ -681,11 +681,6 @@ class UmiResidualDataset(BaseImageDataset):
         zero = self.labels == 0
         correction_count = int(np.count_nonzero(correction))
         zero_count = int(np.count_nonzero(zero))
-        if correction_count == 0 or zero_count == 0:
-            raise ValueError(
-                "Balanced correction sampling requires both correction and "
-                "zero-attempt samples"
-            )
         weights = np.empty(len(self), dtype=np.float64)
         family_ids = getattr(
             self, "sample_family_ids", self.correction_family_ids
@@ -693,42 +688,61 @@ class UmiResidualDataset(BaseImageDataset):
         human_fraction_within_nonzero = getattr(
             self, "human_fraction_within_nonzero", None
         )
-        if human_fraction_within_nonzero is not None:
-            human = self.target_kinds == 1
-            accepted = self.target_kinds == 2
-            if not np.any(human) or not np.any(accepted):
-                raise ValueError(
-                    "Three-way balancing requires both human-correction and "
-                    "accepted-rollout targets"
-                )
 
-            def assign_family_mass(mask: np.ndarray, mass: float) -> None:
-                selected_families = family_ids[mask]
-                unique_families, family_counts = np.unique(
-                    selected_families, return_counts=True
-                )
-                count_by_id = dict(zip(unique_families, family_counts))
-                weights[mask] = np.asarray(
-                    [
-                        mass / len(unique_families) / count_by_id[family_id]
-                        for family_id in selected_families
-                    ],
-                    dtype=np.float64,
-                )
-
-            human_mass = (
-                self.correction_fraction
-                * human_fraction_within_nonzero
+        def assign_family_mass(mask: np.ndarray, mass: float) -> None:
+            """Split ``mass`` equally across source families in ``mask``."""
+            selected_families = family_ids[mask]
+            unique_families, family_counts = np.unique(
+                selected_families, return_counts=True
             )
-            accepted_mass = self.correction_fraction - human_mass
-            assign_family_mass(human, human_mass)
-            assign_family_mass(accepted, accepted_mass)
+            count_by_id = dict(zip(unique_families, family_counts))
+            weights[mask] = np.asarray(
+                [
+                    mass / len(unique_families) / count_by_id[family_id]
+                    for family_id in selected_families
+                ],
+                dtype=np.float64,
+            )
+
+        if correction_count == 0:
+            # A replay round may legitimately contain only exact-zero rows.
+            # The outer collection still assigns this round's total mass.
             if self.balance_zeros_by_source_event:
-                assign_family_mass(zero, 1.0 - self.correction_fraction)
+                assign_family_mass(zero, 1.0)
             else:
-                weights[zero] = (
-                    1.0 - self.correction_fraction
-                ) / zero_count
+                weights[zero] = 1.0 / zero_count
+            return torch.from_numpy(weights)
+
+        # A second-round dataset can contain only human and accepted-rollout
+        # residual targets. Normalize its available nonzero classes to one;
+        # the collection will subsequently apply the configured round mass.
+        correction_mass = 1.0 if zero_count == 0 else self.correction_fraction
+        zero_mass = 1.0 - correction_mass
+        if human_fraction_within_nonzero is not None:
+            human = correction & (self.target_kinds == 1)
+            accepted = correction & (self.target_kinds == 2)
+            has_human = bool(np.any(human))
+            has_accepted = bool(np.any(accepted))
+            if not has_human and not has_accepted:
+                raise ValueError(
+                    "Nonzero supervision rows have no supported target_kind"
+                )
+            if has_human and has_accepted:
+                human_mass = (
+                    correction_mass * human_fraction_within_nonzero
+                )
+                accepted_mass = correction_mass - human_mass
+                assign_family_mass(human, human_mass)
+                assign_family_mass(accepted, accepted_mass)
+            elif has_human:
+                assign_family_mass(human, correction_mass)
+            else:
+                assign_family_mass(accepted, correction_mass)
+            if zero_count:
+                if self.balance_zeros_by_source_event:
+                    assign_family_mass(zero, zero_mass)
+                else:
+                    weights[zero] = zero_mass / zero_count
             return torch.from_numpy(weights)
         if self.balance_corrections_by_source_event:
             correction_families = family_ids[correction]
@@ -739,7 +753,7 @@ class UmiResidualDataset(BaseImageDataset):
             correction_family_count = len(unique_families)
             weights[correction] = np.asarray(
                 [
-                    self.correction_fraction
+                    correction_mass
                     / correction_family_count
                     / family_count_by_id[family_id]
                     for family_id in correction_families
@@ -747,24 +761,12 @@ class UmiResidualDataset(BaseImageDataset):
                 dtype=np.float64,
             )
         else:
-            weights[correction] = self.correction_fraction / correction_count
-        if getattr(self, "balance_zeros_by_source_event", False):
-            zero_families = family_ids[zero]
-            unique_families, family_counts = np.unique(
-                zero_families, return_counts=True
-            )
-            family_count_by_id = dict(zip(unique_families, family_counts))
-            weights[zero] = np.asarray(
-                [
-                    (1.0 - self.correction_fraction)
-                    / len(unique_families)
-                    / family_count_by_id[family_id]
-                    for family_id in zero_families
-                ],
-                dtype=np.float64,
-            )
-        else:
-            weights[zero] = (1.0 - self.correction_fraction) / zero_count
+            weights[correction] = correction_mass / correction_count
+        if zero_count:
+            if getattr(self, "balance_zeros_by_source_event", False):
+                assign_family_mass(zero, zero_mass)
+            else:
+                weights[zero] = zero_mass / zero_count
         return torch.from_numpy(weights)
 
     def get_residual_normalizer(self) -> SingleFieldLinearNormalizer:

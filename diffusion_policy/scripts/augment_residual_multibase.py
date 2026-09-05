@@ -250,7 +250,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     dataset._ensure_open()
     augmented: List[Dict[str, Any]] = []
     rejection_reasons: Counter[str] = Counter()
-    correction_local_indices = np.flatnonzero(dataset.labels == 1)
+    # Schema-v2 second-round datasets also contain nonzero targets that
+    # distill an accepted previous-round rollout. Multi-base augmentation is
+    # defined only for actual human edits, not every nonzero residual.
+    correction_local_indices = np.flatnonzero(
+        dataset.correction_labels == 1
+    )
     for correction_number, local_index in enumerate(correction_local_indices):
         source_index = int(dataset.indices[int(local_index)])
         sample = dataset[int(local_index)]
@@ -345,7 +350,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             sum(
                 sum(row["source_index"] == int(source) for row in augmented)
                 == args.candidates_per_correction
-                for source in dataset.indices[dataset.labels == 1]
+                for source in dataset.indices[dataset.correction_labels == 1]
             )
         ),
         "rejection_reasons": dict(rejection_reasons),

@@ -284,3 +284,42 @@ def test_residual_collection_assigns_explicit_mass_to_each_round(tmp_path):
     weights = collection.get_sampling_weights().numpy()
     np.testing.assert_allclose(weights[:4].sum(), 0.25)
     np.testing.assert_allclose(weights[4:].sum(), 0.75)
+
+
+def test_second_round_nonzero_only_child_balances_human_and_accepted():
+    dataset = object.__new__(UmiResidualDataset)
+    dataset.indices = np.arange(5)
+    dataset.labels = np.ones(5, dtype=np.uint8)
+    dataset.correction_labels = np.array([1, 1, 0, 0, 0], dtype=np.uint8)
+    dataset.target_kinds = np.array([1, 1, 2, 2, 2], dtype=np.uint8)
+    dataset.sample_family_ids = np.array([10, 10, 20, 21, 22], dtype=np.int64)
+    dataset.correction_family_ids = dataset.sample_family_ids
+    dataset.sample_mode = "all"
+    dataset.correction_fraction = 0.5
+    dataset.human_fraction_within_nonzero = 0.5
+    dataset.balance_corrections_by_source_event = True
+    dataset.balance_zeros_by_source_event = False
+
+    weights = dataset.get_sampling_weights().numpy()
+    np.testing.assert_allclose(
+        weights, [0.25, 0.25, 1 / 6, 1 / 6, 1 / 6]
+    )
+    np.testing.assert_allclose(weights.sum(), 1.0)
+
+
+def test_three_way_request_handles_human_zero_child_without_accepted_rows():
+    dataset = object.__new__(UmiResidualDataset)
+    dataset.indices = np.arange(4)
+    dataset.labels = np.array([1, 1, 0, 0], dtype=np.uint8)
+    dataset.correction_labels = np.array([1, 1, 0, 0], dtype=np.uint8)
+    dataset.target_kinds = np.array([1, 1, 0, 0], dtype=np.uint8)
+    dataset.sample_family_ids = np.array([10, 11, 20, 21], dtype=np.int64)
+    dataset.correction_family_ids = dataset.sample_family_ids
+    dataset.sample_mode = "all"
+    dataset.correction_fraction = 0.5
+    dataset.human_fraction_within_nonzero = 0.5
+    dataset.balance_corrections_by_source_event = True
+    dataset.balance_zeros_by_source_event = False
+
+    weights = dataset.get_sampling_weights().numpy()
+    np.testing.assert_allclose(weights, [0.25, 0.25, 0.25, 0.25])
