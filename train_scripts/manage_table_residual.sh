@@ -120,8 +120,13 @@ if [ -n "${REPLAY_RESIDUAL_DATASET_PATH}" ]; then
   )
 fi
 if [ -n "${INIT_RESIDUAL_CKPT}" ]; then
+  # Hydra treats every unescaped '=' in an override as grammar. Checkpoint
+  # filenames produced by this workspace contain epoch=... and
+  # val_composite_objective=..., so escape those value-side delimiters before
+  # passing the path back as a second-round warm start.
+  INIT_RESIDUAL_CKPT_HYDRA="${INIT_RESIDUAL_CKPT//=/\\=}"
   ROUND2_ARGS+=(
-    "training.init_residual_checkpoint=${INIT_RESIDUAL_CKPT}"
+    "training.init_residual_checkpoint=${INIT_RESIDUAL_CKPT_HYDRA}"
     "training.init_residual_state_key=${INIT_RESIDUAL_STATE_KEY}"
     "training.init_use_checkpoint_normalizer=${INIT_USE_CHECKPOINT_NORMALIZER}"
   )
