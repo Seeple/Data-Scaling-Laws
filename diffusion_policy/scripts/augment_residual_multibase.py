@@ -78,12 +78,23 @@ def _copy_source_rows(source: zarr.Array, destination: zarr.Array) -> None:
         destination[start:stop] = source[start:stop]
 
 
+def _copy_selected_source_rows(
+    source: zarr.Array,
+    destination: zarr.Array,
+    source_indices: np.ndarray,
+) -> None:
+    """Copy an audited subset without materializing a large camera array."""
+    for output_index, source_index in enumerate(source_indices):
+        destination[output_index] = source[int(source_index)]
+
+
 def _write_augmented_zarr(
     input_path: Path,
     output_path: Path,
     augmented: List[Dict[str, Any]],
     summary: Dict[str, Any],
     overwrite: bool,
+    excluded_source_indices: set[int] | None = None,
 ) -> None:
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"Output exists: {output_path}; pass --overwrite")
@@ -96,7 +107,17 @@ def _write_augmented_zarr(
         source_root = zarr.group(store=input_store)
         source_data = source_root["data"]
         source_count = int(source_root.attrs["sample_count"])
-        total_count = source_count + len(augmented)
+        excluded_source_indices = excluded_source_indices or set()
+        kept_source_indices = np.asarray(
+            [
+                index
+                for index in range(source_count)
+                if index not in excluded_source_indices
+            ],
+            dtype=np.int64,
+        )
+        kept_count = int(len(kept_source_indices))
+        total_count = kept_count + len(augmented)
         directory_store = zarr.DirectoryStore(str(temp_dir / "dataset.zarr"))
         output_root = zarr.group(store=directory_store)
         output_data = output_root.create_group("data")
@@ -108,7 +129,13 @@ def _write_augmented_zarr(
             "residual_rotation_axis_angle",
             "residual_gripper",
         }
+        provenance_keys = {
+            "multibase_resample_index",
+            "multibase_source_sample_index",
+        }
         for key in source_data.keys():
+            if key in provenance_keys:
+                continue
             source = source_data[key]
             chunks = (min(source.chunks[0], total_count),) + source.chunks[1:]
             destination = output_data.create_dataset(
@@ -120,18 +147,24 @@ def _write_augmented_zarr(
                 filters=source.filters,
                 fill_value=source.fill_value,
             )
-            _copy_source_rows(source, destination)
+            if excluded_source_indices:
+                _copy_selected_source_rows(
+                    source, destination, kept_source_indices
+                )
+            else:
+                _copy_source_rows(source, destination)
             for offset, record in enumerate(augmented):
-                destination[source_count + offset] = (
+                destination[kept_count + offset] = (
                     record[key]
                     if key in override_keys
                     else source[int(record["source_index"])]
                 )
 
         resample_index = np.full(total_count, -1, dtype=np.int64)
-        resample_source_index = np.arange(total_count, dtype=np.int64)
+        resample_source_index = np.empty(total_count, dtype=np.int64)
+        resample_source_index[:kept_count] = kept_source_indices
         for offset, record in enumerate(augmented):
-            row = source_count + offset
+            row = kept_count + offset
             resample_index[row] = int(record["resample_index"])
             resample_source_index[row] = int(record["source_index"])
         output_data.create_dataset(
@@ -146,7 +179,10 @@ def _write_augmented_zarr(
         )
 
         source_records = list(source_root["meta"].attrs.get("records", []))
-        output_records = copy.deepcopy(source_records)
+        output_records = [
+            copy.deepcopy(source_records[int(index)])
+            for index in kept_source_indices
+        ]
         for record in augmented:
             metadata = copy.deepcopy(source_records[int(record["source_index"])])
             metadata.update(
@@ -166,12 +202,22 @@ def _write_augmented_zarr(
                 "sample_count": total_count,
                 "multibase_resampling_enabled": True,
                 "multibase_original_sample_count": source_count,
+                "multibase_retained_original_sample_count": kept_count,
+                "multibase_removed_original_correction_count": len(
+                    excluded_source_indices
+                ),
                 "multibase_augmented_sample_count": len(augmented),
                 "multibase_filter_config": summary["filter_config"],
                 "multibase_candidates_per_correction": summary[
                     "candidates_per_correction"
                 ],
                 "multibase_seed": summary["seed"],
+                "multibase_compatibility_reference": summary[
+                    "compatibility_reference"
+                ],
+                "multibase_replace_original_corrections": summary[
+                    "replace_original_corrections"
+                ],
             }
         )
         if output_path.exists():
@@ -250,6 +296,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     dataset._ensure_open()
     augmented: List[Dict[str, Any]] = []
     rejection_reasons: Counter[str] = Counter()
+    accepted_counts_by_source: Dict[int, int] = {}
+    rejection_reasons_by_source: Dict[int, Counter[str]] = {}
     # Schema-v2 second-round datasets also contain nonzero targets that
     # distill an accepted previous-round rollout. Multi-base augmentation is
     # defined only for actual human edits, not every nonzero residual.
@@ -262,6 +310,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         recorded_base = np.asarray(
             dataset._data["frozen_base_action"][source_index], dtype=np.float64
         )
+        rollout_attempt = np.asarray(
+            dataset._data["rollout_attempt_action"][source_index],
+            dtype=np.float64,
+        )
         edited_goal = np.asarray(
             dataset._data["final_edited_action"][source_index], dtype=np.float64
         )
@@ -271,15 +323,28 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         latest_pose = flexiv_state_to_pose_matrix(
             np.asarray(dataset._data["robot_state"][source_index])
         )[-1]
-        accepted_bases: List[np.ndarray] = [recorded_base]
+        compatibility_reference = (
+            rollout_attempt
+            if args.compatibility_reference == "rollout_attempt"
+            else recorded_base
+        )
+        # In replacement mode, diversity is required among fresh frozen-base
+        # samples, not relative to the semantically stale source base row.
+        accepted_bases: List[np.ndarray] = (
+            [] if args.replace_original_corrections else [recorded_base]
+        )
         accepted_count = 0
         draw_count = 0
+        source_rejections: Counter[str] = Counter()
         max_draws = args.candidates_per_correction * args.max_draw_multiplier
         torch.manual_seed(args.seed + source_index)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed + source_index)
 
-        while accepted_count < args.candidates_per_correction and draw_count < max_draws:
+        while (
+            accepted_count < args.candidates_per_correction
+            and draw_count < max_draws
+        ):
             batch_count = min(args.sample_batch_size, max_draws - draw_count)
             obs_batch = _repeat_obs(sample["obs"], batch_count, device)
             with torch.no_grad():
@@ -303,7 +368,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 )
                 accepted, reason, metrics = evaluate_multibase_candidate(
                     candidate,
-                    recorded_base,
+                    compatibility_reference,
                     edited_goal,
                     valid_mask,
                     accepted_bases,
@@ -311,6 +376,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 )
                 if not accepted:
                     rejection_reasons[reason] += 1
+                    source_rejections[reason] += 1
                     continue
                 residual = compute_world_frame_residual(candidate, edited_goal)
                 augmented.append(
@@ -328,10 +394,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 accepted_count += 1
                 if accepted_count >= args.candidates_per_correction:
                     break
+        accepted_counts_by_source[source_index] = accepted_count
+        rejection_reasons_by_source[source_index] = source_rejections
         print(
             f"[{correction_number + 1}/{len(correction_local_indices)}] "
-            f"source={source_index} accepted={accepted_count}/{args.candidates_per_correction} "
-            f"draws={draw_count}"
+            f"source={source_index} accepted={accepted_count}/"
+            f"{args.candidates_per_correction} "
+            f"draws={draw_count} rejections={dict(source_rejections)}"
         )
 
     summary = {
@@ -353,19 +422,58 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 for source in dataset.indices[dataset.correction_labels == 1]
             )
         ),
+        "corrections_with_no_fresh_candidate": sorted(
+            source_index
+            for source_index, count in accepted_counts_by_source.items()
+            if count == 0
+        ),
+        "accepted_counts_by_source": {
+            str(source_index): count
+            for source_index, count in accepted_counts_by_source.items()
+        },
+        "rejection_reasons_by_source": {
+            str(source_index): dict(reasons)
+            for source_index, reasons in rejection_reasons_by_source.items()
+        },
+        "compatibility_reference": args.compatibility_reference,
+        "replace_original_corrections": bool(
+            args.replace_original_corrections
+        ),
         "rejection_reasons": dict(rejection_reasons),
         "filter_config": asdict(filter_config),
     }
     if args.require_full_count and len(augmented) != (
         len(correction_local_indices) * args.candidates_per_correction
     ):
+        print(json.dumps(summary, indent=2))
         raise ValueError(
             "Filtered sampling did not produce the requested number of candidates; "
             "rerun with an audited threshold change or without --require-full-count"
         )
+    if args.replace_original_corrections and any(
+        count == 0 for count in accepted_counts_by_source.values()
+    ):
+        print(json.dumps(summary, indent=2))
+        raise ValueError(
+            "Replacement mode could not generate a fresh frozen-base row for "
+            "every human correction; source data was left untouched"
+        )
+    excluded_source_indices = (
+        {
+            int(source_index)
+            for source_index in dataset.indices[dataset.correction_labels == 1]
+        }
+        if args.replace_original_corrections
+        else set()
+    )
     dataset.close()
     _write_augmented_zarr(
-        input_path, output_path, augmented, summary, args.overwrite
+        input_path,
+        output_path,
+        augmented,
+        summary,
+        args.overwrite,
+        excluded_source_indices=excluded_source_indices,
     )
     report_path = output_path.with_suffix(output_path.suffix + ".multibase.json")
     with report_path.open("w", encoding="utf-8") as stream:
@@ -392,9 +500,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--use-model-weights", action="store_true")
     parser.add_argument("--require-full-count", action="store_true")
+    parser.add_argument(
+        "--replace-original-corrections",
+        action="store_true",
+        help=(
+            "Remove recorded human rows and replace them with fresh frozen-base "
+            "samples at the intervention observation. This is required when a "
+            "later-round rollout was generated by a residual policy."
+        ),
+    )
+    parser.add_argument(
+        "--compatibility-reference",
+        choices=("recorded_base", "rollout_attempt"),
+        default="recorded_base",
+        help=(
+            "Chunk used to audit fresh candidates. Later-round replacement "
+            "datasets should use rollout_attempt because recorded_base is a "
+            "stale raw-base suffix."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     defaults = MultiBaseFilterConfig()
-    parser.add_argument("--comparison-steps", type=int, default=defaults.comparison_steps)
+    parser.add_argument(
+        "--comparison-steps", type=int, default=defaults.comparison_steps
+    )
     for name in (
         "max_first_position_deviation_m",
         "max_prefix_position_deviation_m",

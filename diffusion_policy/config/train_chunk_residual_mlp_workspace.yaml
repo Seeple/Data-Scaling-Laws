@@ -79,6 +79,13 @@ training:
   init_residual_checkpoint: null
   init_residual_state_key: auto
   init_use_checkpoint_normalizer: true
+  # When refitting a later-round normalizer, analytically rescale the final
+  # residual head so warm-start physical predictions remain unchanged.
+  reparameterize_output_for_new_normalizer: true
+  # Optional protection for a later-round warm start. When set, the new EMA
+  # tracker uses at least this decay from its first update instead of replacing
+  # the inherited EMA weights on the first optimizer step.
+  init_ema_min_decay: null
   num_epochs: 200
   lr_scheduler: cosine
   lr_warmup_steps: 100
@@ -90,6 +97,15 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
+
+validation:
+  # val_composite_objective is category-balanced rather than row-count
+  # weighted, so numerous rollout/zero rows cannot hide human-correction
+  # regression during checkpoint selection.
+  human_loss_weight: 1.0
+  accepted_rollout_loss_weight: 1.0
+  zero_loss_weight: 1.0
+  gate_loss_weight: 1.0
 
 logging:
   project: umi-residual

@@ -36,6 +36,7 @@ NUM_PROCESSES="${NUM_PROCESSES:-}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29511}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 NUM_EPOCHS="${NUM_EPOCHS:-200}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LEARNING_RATE="${LEARNING_RATE:-3e-4}"
@@ -60,7 +61,14 @@ VAL_EPISODE_INDICES_BY_DATASET="${VAL_EPISODE_INDICES_BY_DATASET:-null}"
 INIT_RESIDUAL_CKPT="${INIT_RESIDUAL_CKPT:-}"
 INIT_RESIDUAL_STATE_KEY="${INIT_RESIDUAL_STATE_KEY:-auto}"
 INIT_USE_CHECKPOINT_NORMALIZER="${INIT_USE_CHECKPOINT_NORMALIZER:-true}"
+REPARAMETERIZE_OUTPUT_FOR_NEW_NORMALIZER="${REPARAMETERIZE_OUTPUT_FOR_NEW_NORMALIZER:-true}"
+# For later-round warm starts, use e.g. 0.99 so the first optimizer update does
+# not replace the inherited EMA checkpoint. Leave null for first-round runs.
+INIT_EMA_MIN_DECAY="${INIT_EMA_MIN_DECAY:-null}"
 HUMAN_FRACTION_WITHIN_NONZERO="${HUMAN_FRACTION_WITHIN_NONZERO:-null}"
+VAL_HUMAN_LOSS_WEIGHT="${VAL_HUMAN_LOSS_WEIGHT:-1.0}"
+VAL_ACCEPTED_ROLLOUT_LOSS_WEIGHT="${VAL_ACCEPTED_ROLLOUT_LOSS_WEIGHT:-1.0}"
+VAL_ZERO_LOSS_WEIGHT="${VAL_ZERO_LOSS_WEIGHT:-1.0}"
 
 if [ -n "${GPU_LIST}" ]; then
   export CUDA_VISIBLE_DEVICES="${GPU_LIST}"
@@ -129,6 +137,8 @@ if [ -n "${INIT_RESIDUAL_CKPT}" ]; then
     "training.init_residual_checkpoint=${INIT_RESIDUAL_CKPT_HYDRA}"
     "training.init_residual_state_key=${INIT_RESIDUAL_STATE_KEY}"
     "training.init_use_checkpoint_normalizer=${INIT_USE_CHECKPOINT_NORMALIZER}"
+    "training.reparameterize_output_for_new_normalizer=${REPARAMETERIZE_OUTPUT_FOR_NEW_NORMALIZER}"
+    "training.init_ema_min_decay=${INIT_EMA_MIN_DECAY}"
   )
 fi
 
@@ -152,8 +162,12 @@ accelerate launch \
   policy.zero_loss_weight="${ZERO_LOSS_WEIGHT}" \
   policy.correction_loss_weight="${CORRECTION_LOSS_WEIGHT}" \
   policy.gate_loss_weight="${GATE_LOSS_WEIGHT}" \
+  validation.human_loss_weight="${VAL_HUMAN_LOSS_WEIGHT}" \
+  validation.accepted_rollout_loss_weight="${VAL_ACCEPTED_ROLLOUT_LOSS_WEIGHT}" \
+  validation.zero_loss_weight="${VAL_ZERO_LOSS_WEIGHT}" \
   base_policy.encoder_mode="${ENCODER_MODE}" \
   training.num_epochs="${NUM_EPOCHS}" \
+  training.checkpoint_every="${CHECKPOINT_EVERY}" \
   dataloader.batch_size="${BATCH_SIZE}" \
   dataloader.num_workers="${NUM_WORKERS}" \
   dataloader.persistent_workers="$([ "${NUM_WORKERS}" -gt 0 ] && echo true || echo false)" \

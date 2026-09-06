@@ -21,6 +21,7 @@ from typing import Dict
 import hydra
 import numpy as np
 import torch
+import torch.nn.functional as F
 import tqdm
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
@@ -219,6 +220,8 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         self.base_policy.obs_encoder.eval()
         loss_values = []
         correction_loss_values = []
+        human_loss_values = []
+        accepted_rollout_loss_values = []
         zero_loss_values = []
         gate_loss_values = []
         correction_position_errors = []
@@ -246,25 +249,52 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
                 batch.get("gate_target"),
             )
             loss_values.append(output["loss"].detach().reshape(1))
-            correction_loss_values.append(
-                output["correction_loss"].detach().reshape(1)
-            )
-            zero_loss_values.append(output["zero_loss"].detach().reshape(1))
             gate_loss_values.append(output["gate_loss"].detach().reshape(1))
 
             prediction = output["predicted_residual"]
             target = batch["residual_action"]
+            normalized_element_loss = F.huber_loss(
+                output["predicted_normalized_residual"],
+                policy.residual_normalizer.normalize(target),
+                reduction="none",
+                delta=policy.huber_delta,
+            )
             supervision_label = batch.get(
                 "residual_supervision_label", batch["correction_label"]
             )
+            target_kind = batch.get("target_kind")
+            if target_kind is None:
+                target_kind = batch["correction_label"].to(torch.int64)
             correction_mask = (
                 batch["valid_action_mask"].bool()
                 & (supervision_label > 0.5)[:, None]
             )
             zero_mask = (
-                torch.ones_like(batch["valid_action_mask"], dtype=torch.bool)
+                batch["valid_action_mask"].bool()
                 & (supervision_label <= 0.5)[:, None]
             )
+            human_mask = (
+                batch["valid_action_mask"].bool()
+                & (target_kind == 1)[:, None]
+            )
+            accepted_rollout_mask = (
+                batch["valid_action_mask"].bool()
+                & (target_kind == 2)[:, None]
+            )
+
+            def append_masked_element_loss(values, mask):
+                expanded = mask.unsqueeze(-1).expand_as(normalized_element_loss)
+                if expanded.any():
+                    values.append(normalized_element_loss[expanded].detach())
+
+            append_masked_element_loss(
+                correction_loss_values, correction_mask
+            )
+            append_masked_element_loss(human_loss_values, human_mask)
+            append_masked_element_loss(
+                accepted_rollout_loss_values, accepted_rollout_mask
+            )
+            append_masked_element_loss(zero_loss_values, zero_mask)
             if correction_mask.any():
                 delta = prediction[correction_mask] - target[correction_mask]
                 correction_position_errors.append(
@@ -307,6 +337,10 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         metrics = {
             "val_loss": gathered_mean(loss_values),
             "val_correction_loss": gathered_mean(correction_loss_values),
+            "val_human_correction_loss": gathered_mean(human_loss_values),
+            "val_accepted_rollout_loss": gathered_mean(
+                accepted_rollout_loss_values
+            ),
             "val_zero_loss": gathered_mean(zero_loss_values),
             "val_gate_loss": gathered_mean(gate_loss_values),
             "val_correction_position_error_mm": 1000.0
@@ -344,10 +378,16 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
                     / max(1, negative_count),
                 }
             )
+        validation_cfg = self.cfg.get("validation", {})
         metrics["val_composite_objective"] = (
-            metrics["val_correction_loss"]
-            + metrics["val_zero_loss"]
-            + metrics["val_gate_loss"]
+            float(validation_cfg.get("human_loss_weight", 1.0))
+            * metrics["val_human_correction_loss"]
+            + float(validation_cfg.get("accepted_rollout_loss_weight", 1.0))
+            * metrics["val_accepted_rollout_loss"]
+            + float(validation_cfg.get("zero_loss_weight", 1.0))
+            * metrics["val_zero_loss"]
+            + float(validation_cfg.get("gate_loss_weight", 1.0))
+            * metrics["val_gate_loss"]
         )
         self.base_policy.obs_encoder.train(encoder_was_training)
         return metrics
@@ -483,9 +523,25 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
         accelerator.wait_for_everyone()
         with open(normalizer_path, "rb") as normalizer_file:
             residual_normalizer = pickle.load(normalizer_file)
-        self.model.set_residual_normalizer(residual_normalizer)
-        if self.ema_model is not None:
-            self.ema_model.set_residual_normalizer(residual_normalizer)
+        reparameterize_normalizer = bool(
+            self.initial_residual_checkpoint
+            and not use_initial_normalizer
+            and cfg.training.get(
+                "reparameterize_output_for_new_normalizer", True
+            )
+        )
+        if reparameterize_normalizer:
+            self.model.reparameterize_residual_normalizer(
+                residual_normalizer
+            )
+            if self.ema_model is not None:
+                self.ema_model.reparameterize_residual_normalizer(
+                    residual_normalizer
+                )
+        else:
+            self.model.set_residual_normalizer(residual_normalizer)
+            if self.ema_model is not None:
+                self.ema_model.set_residual_normalizer(residual_normalizer)
 
         total_steps = (
             len(train_dataloader) * int(cfg.training.num_epochs)
@@ -527,6 +583,26 @@ class TrainChunkResidualWorkspace(BaseWorkspace):
             ema: EMAModel | None = hydra.utils.instantiate(
                 cfg.ema, model=self.ema_model
             )
+            init_ema_min_decay = cfg.training.get(
+                "init_ema_min_decay", None
+            )
+            if self.initial_residual_checkpoint and init_ema_min_decay not in {
+                None,
+                "null",
+            }:
+                init_ema_min_decay = float(init_ema_min_decay)
+                if not 0.0 <= init_ema_min_decay < 1.0:
+                    raise ValueError(
+                        "training.init_ema_min_decay must be in [0, 1)"
+                    )
+                ema.min_value = max(ema.min_value, init_ema_min_decay)
+                # EMAModel normally uses decay=0 for its first update. Advance
+                # its schedule just enough for min_value to apply immediately,
+                # preserving the inherited later-round EMA checkpoint.
+                ema.optimization_step = max(
+                    ema.optimization_step,
+                    int(ema.update_after_step) + 2,
+                )
         else:
             ema = None
 
