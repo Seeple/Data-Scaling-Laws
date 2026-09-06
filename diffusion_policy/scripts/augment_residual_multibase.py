@@ -310,10 +310,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         recorded_base = np.asarray(
             dataset._data["frozen_base_action"][source_index], dtype=np.float64
         )
-        rollout_attempt = np.asarray(
-            dataset._data["rollout_attempt_action"][source_index],
-            dtype=np.float64,
-        )
         edited_goal = np.asarray(
             dataset._data["final_edited_action"][source_index], dtype=np.float64
         )
@@ -323,11 +319,18 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         latest_pose = flexiv_state_to_pose_matrix(
             np.asarray(dataset._data["robot_state"][source_index])
         )[-1]
-        compatibility_reference = (
-            rollout_attempt
-            if args.compatibility_reference == "rollout_attempt"
-            else recorded_base
-        )
+        if args.compatibility_reference == "rollout_attempt":
+            if "rollout_attempt_action" not in dataset._data:
+                raise ValueError(
+                    "--compatibility-reference=rollout_attempt requires a "
+                    "dataset containing data/rollout_attempt_action"
+                )
+            compatibility_reference = np.asarray(
+                dataset._data["rollout_attempt_action"][source_index],
+                dtype=np.float64,
+            )
+        else:
+            compatibility_reference = recorded_base
         # In replacement mode, diversity is required among fresh frozen-base
         # samples, not relative to the semantically stale source base row.
         accepted_bases: List[np.ndarray] = (
