@@ -87,6 +87,44 @@ class ChunkResidualPolicy(nn.Module):
             copy.deepcopy(normalizer.state_dict())
         )
 
+    @torch.no_grad()
+    def reparameterize_residual_normalizer(
+        self, normalizer: SingleFieldLinearNormalizer
+    ) -> None:
+        """Change residual scaling while preserving physical predictions.
+
+        A later DAgger round can expand the residual range substantially. A
+        naive normalizer replacement changes every warm-start prediction even
+        before optimization. Rescale the final linear head so
+        ``new_unnormalize(new_head(x)) == old_unnormalize(old_head(x))``.
+        """
+        old_params = self.residual_normalizer.params_dict
+        new_params = normalizer.params_dict
+        old_scale = old_params["scale"].detach()
+        old_offset = old_params["offset"].detach()
+        new_scale = new_params["scale"].detach().to(old_scale)
+        new_offset = new_params["offset"].detach().to(old_offset)
+        if old_scale.numel() != self.residual_action_dim:
+            raise ValueError("Old residual normalizer dimension mismatch")
+        if new_scale.shape != old_scale.shape:
+            raise ValueError("New residual normalizer dimension mismatch")
+        if torch.any(old_scale == 0) or torch.any(new_scale == 0):
+            raise ValueError("Residual normalizer scale must be nonzero")
+
+        ratio = new_scale / old_scale
+        shift = new_offset - old_offset * ratio
+        head = self.model.residual_head
+        weight = head.weight.reshape(
+            self.residual_horizon, self.residual_action_dim, -1
+        )
+        bias = head.bias.reshape(
+            self.residual_horizon, self.residual_action_dim
+        )
+        weight.mul_(ratio.reshape(1, -1, 1))
+        bias.mul_(ratio.reshape(1, -1))
+        bias.add_(shift.reshape(1, -1))
+        self.set_residual_normalizer(normalizer)
+
     @staticmethod
     def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         while mask.ndim < value.ndim:
@@ -146,7 +184,11 @@ class ChunkResidualPolicy(nn.Module):
         correction_rows = supervision_label > 0.5
         zero_rows = ~correction_rows
         correction_mask = valid_action_mask & correction_rows[:, None]
-        zero_mask = torch.ones_like(valid_action_mask) & zero_rows[:, None]
+        # Zero policy-attempt rows may intentionally expose only the prefix
+        # that the controller can execute before the next base refresh. Honor
+        # that mask just like correction rows; otherwise a nominal H=5 zero
+        # sample silently contributes 16 supervised waypoints.
+        zero_mask = valid_action_mask & zero_rows[:, None]
         invalid_prefix_mask = (~valid_action_mask) & correction_rows[:, None]
 
         correction_loss = self._masked_mean(element_loss, correction_mask)

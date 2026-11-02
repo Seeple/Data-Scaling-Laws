@@ -1,4 +1,4 @@
-task_name="manage_table_7_28_async_hitl_single_pattern_7_30_only_human_contiguous_action_mask"
+task_name="manage_table_7_28_async_hitl_8_7_onlyhuman"
 logging_time=$(date "+%d-%H.%M.%S")
 now_seconds="${logging_time: -8}"
 now_date=$(date "+%Y.%m.%d")
@@ -190,11 +190,11 @@ if [ -n "${finetune_ckpt}" ]; then
 fi
 
 # launch training
-accelerate launch --main_process_port 29501 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
+accelerate launch --main_process_port 29502 --config_file "${ACCELERATE_CONFIG_FILE}" "${ACCELERATE_ARGS[@]}" --mixed_precision 'bf16' ../train.py \
 	--config-name=train_diffusion_unet_timm_umi_dagger_workspace \
 	multi_run.run_dir=${run_dir} multi_run.wandb_name_base=${logging_time} hydra.run.dir=${run_dir} hydra.sweep.dir=${run_dir} \
 	task.teleop_dataset_path=../data/dataset/manage_table/teleop_data/manage_table_raw_7_27_no_halt_15hz.zarr.zip \
-	task.hitl_dataset_path=../data/dataset/manage_table/hitl_data/async_hitl/manage_table_async_hitl_single_pattern_7_30_15hz.zarr.zip \
+	task.hitl_dataset_path=../data/dataset/manage_table/hitl_data/async_hitl/manage_table_async_hitl_iter1_8_7.zarr.zip \
 	training.num_epochs=400 \
 	dataloader.batch_size=64 \
 	dataloader.num_workers=16 \
