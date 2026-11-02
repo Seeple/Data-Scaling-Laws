@@ -91,3 +91,48 @@ def test_nonhuman_rollout_target_can_supervise_residual_and_gate():
     assert output["correction_loss"] > 0
     assert output["zero_loss"] == 0
     assert output["gate_loss"] > 0
+
+
+def test_zero_loss_honors_policy_attempt_valid_prefix_mask():
+    model = ChunkResidualMLP(obs_feature_dim=32, gate_enabled=False)
+    policy = ChunkResidualPolicy(model)
+    policy.set_residual_normalizer(_identity_normalizer())
+    with torch.no_grad():
+        model.residual_head.bias.zero_()
+        model.residual_head.bias.reshape(16, 7)[5:] = 1.0
+    valid_prefix = torch.zeros(1, 16, dtype=torch.bool)
+    valid_prefix[:, :5] = True
+    output = policy(
+        torch.zeros(1, 32),
+        torch.zeros(1, 16, 10),
+        torch.zeros(1, 16, 7),
+        valid_prefix,
+        correction_label=torch.zeros(1),
+    )
+    assert output["zero_loss"] == 0
+
+
+def test_normalizer_reparameterization_preserves_physical_residual():
+    model = ChunkResidualMLP(obs_feature_dim=32, gate_enabled=False)
+    policy = ChunkResidualPolicy(model)
+    old = _identity_normalizer()
+    policy.set_residual_normalizer(old)
+    obs = torch.randn(3, 32)
+    base = torch.randn(3, 16, 10)
+    before = policy.predict_residual(obs, base)["residual"].clone()
+
+    scale = np.array([2, 3, 4, 5, 6, 7, 8], dtype=np.float32)
+    offset = np.linspace(-0.3, 0.3, 7, dtype=np.float32)
+    new = SingleFieldLinearNormalizer.create_manual(
+        scale=scale,
+        offset=offset,
+        input_stats_dict={
+            "min": -np.ones(7, dtype=np.float32),
+            "max": np.ones(7, dtype=np.float32),
+            "mean": np.zeros(7, dtype=np.float32),
+            "std": np.ones(7, dtype=np.float32),
+        },
+    )
+    policy.reparameterize_residual_normalizer(new)
+    after = policy.predict_residual(obs, base)["residual"]
+    torch.testing.assert_close(after, before, atol=1e-6, rtol=1e-6)
