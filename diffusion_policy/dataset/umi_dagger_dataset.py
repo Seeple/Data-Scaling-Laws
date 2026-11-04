@@ -1,5 +1,4 @@
 import copy
-import random
 from typing import Dict, Optional
 
 import numpy as np
@@ -9,6 +8,15 @@ from tqdm import tqdm
 
 from diffusion_policy.dataset.umi_dataset import UmiDataset
 from diffusion_policy.dataset.base_dataset import BaseDataset
+from diffusion_policy.dataset.sirius_weighting import (
+    SIRIUS_CLASS_NAMES,
+    SIRIUS_DEMO,
+    SIRIUS_NUM_CLASSES,
+    action_token_classes,
+    build_online_frame_classes,
+    clean_intervention_tags,
+    compute_sirius_importance_weights,
+)
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.common.normalize_util import (
     array_to_stats,
@@ -61,6 +69,16 @@ class DaggerMixedUmiDataset(BaseDataset):
         hitl_skip_rising_edge: bool = False,
         hitl_skip_rising_edge_steps: int = 5,
         hitl_treat_segments_as_episodes: bool = False,
+        sirius_weighting_enabled: bool = False,
+        sirius_source_fps: float = 15.0,
+        sirius_target_intervention_fraction: float = 0.5,
+        sirius_target_pre_intervention_fraction: float = 0.0,
+        sirius_pre_intervention_seconds: float = 1.0,
+        sirius_tag_debounce_enabled: bool = True,
+        sirius_merge_policy_gaps_seconds: float = 0.5,
+        sirius_min_intervention_seconds: float = 0.3,
+        sirius_max_importance_weight: Optional[float] = None,
+        sirius_log_class_stats: bool = True,
         action_normalizer_source: str = "teleop",
         lowdim_obs_normalizer_source: str = "mixed",
         normalizer_num_workers: Optional[int] = None,
@@ -91,6 +109,30 @@ class DaggerMixedUmiDataset(BaseDataset):
         self.hitl_skip_rising_edge = hitl_skip_rising_edge
         self.hitl_skip_rising_edge_steps = int(hitl_skip_rising_edge_steps)
         self.hitl_treat_segments_as_episodes = hitl_treat_segments_as_episodes
+        self.sirius_weighting_enabled = bool(sirius_weighting_enabled)
+        self.sirius_source_fps = float(sirius_source_fps)
+        self.sirius_target_intervention_fraction = float(
+            sirius_target_intervention_fraction
+        )
+        self.sirius_target_pre_intervention_fraction = float(
+            sirius_target_pre_intervention_fraction
+        )
+        self.sirius_pre_intervention_seconds = float(
+            sirius_pre_intervention_seconds
+        )
+        self.sirius_tag_debounce_enabled = bool(sirius_tag_debounce_enabled)
+        self.sirius_merge_policy_gaps_seconds = float(
+            sirius_merge_policy_gaps_seconds
+        )
+        self.sirius_min_intervention_seconds = float(
+            sirius_min_intervention_seconds
+        )
+        self.sirius_max_importance_weight = (
+            None
+            if sirius_max_importance_weight is None
+            else float(sirius_max_importance_weight)
+        )
+        self.sirius_log_class_stats = bool(sirius_log_class_stats)
         assert action_normalizer_source in {"teleop", "mixed"}
         self.action_normalizer_source = action_normalizer_source
         assert lowdim_obs_normalizer_source in {"mixed", "teleop"}
@@ -110,6 +152,23 @@ class DaggerMixedUmiDataset(BaseDataset):
             )
         if self.hitl_min_valid_steps_enabled and self.hitl_min_valid_steps < 1:
             raise ValueError("hitl_min_valid_steps must be at least 1")
+        if self.sirius_weighting_enabled:
+            incompatible = {
+                "hitl_only_tag": self.hitl_only_tag,
+                "hitl_require_full_action_tag": self.hitl_require_full_action_tag,
+                "hitl_action_mask": self.hitl_action_mask,
+                "hitl_contiguous_action_mask": self.hitl_contiguous_action_mask,
+                "hitl_invalid_tail_padding": self.hitl_invalid_tail_padding,
+                "hitl_min_valid_steps_enabled": self.hitl_min_valid_steps_enabled,
+                "hitl_skip_rising_edge": self.hitl_skip_rising_edge,
+                "hitl_treat_segments_as_episodes": self.hitl_treat_segments_as_episodes,
+            }
+            enabled = [name for name, value in incompatible.items() if value]
+            if enabled:
+                raise ValueError(
+                    "Sirius weighting needs the complete rollout and cannot be "
+                    "combined with correction-only filters/masks: " + ", ".join(enabled)
+                )
 
         if hitl_separate_downsample_multipliers:
             obs_multiplier = float(hitl_obs_downsample_multiplier)
@@ -161,6 +220,13 @@ class DaggerMixedUmiDataset(BaseDataset):
         ]
         self.dataset_is_online = [False] + [True] * len(self.online_datasets)
         self.dataset_weights = self._resolve_sampling_weights(rlpd_ratio)
+        self.sirius_online_frame_classes = []
+        self.sirius_buffer_class_counts = None
+        self.sirius_proposal_class_probabilities = None
+        self.sirius_target_class_probabilities = None
+        self.sirius_class_weights = None
+        if self.sirius_weighting_enabled:
+            self._prepare_sirius_weighting()
         print(
             "[DaggerMixedUmiDataset] Sampling buffers: "
             + ", ".join(
@@ -183,6 +249,15 @@ class DaggerMixedUmiDataset(BaseDataset):
             f"obs_multiplier={obs_multiplier}, "
             f"action_multiplier={action_multiplier}"
         )
+        if self.sirius_weighting_enabled:
+            print(
+                "[DaggerMixedUmiDataset] Sirius weighting enabled: "
+                f"pre_intervention_seconds={self.sirius_pre_intervention_seconds}, "
+                f"target_intervention_fraction="
+                f"{self.sirius_target_intervention_fraction}, "
+                f"target_pre_intervention_fraction="
+                f"{self.sirius_target_pre_intervention_fraction}"
+            )
 
         # expose shared attributes for convenience
         self.shape_meta = shape_meta
@@ -318,6 +393,13 @@ class DaggerMixedUmiDataset(BaseDataset):
                             sample["action"], action_valid_mask
                         )
                     sample["action_valid_mask"] = action_valid_mask
+                if self.sirius_weighting_enabled:
+                    sample = self._add_sirius_fields(
+                        sample=sample,
+                        dataset=dataset,
+                        mapped_idx=mapped_idx,
+                        dataset_idx=dataset_idx,
+                    )
                 return sample
             except JpegxlError as exc:
                 attempt += 1
@@ -342,19 +424,191 @@ class DaggerMixedUmiDataset(BaseDataset):
                     val_dataset,
                     dataset_name=f"val_online_{online_idx}",
                 )
+        split_datasets = [teleop_val] + online_vals
+        if self.sirius_weighting_enabled:
+            split_datasets = [
+                _SiriusAnnotatedDataset(
+                    dataset=teleop_val,
+                    class_weights=self.sirius_class_weights,
+                    frame_classes=None,
+                )
+            ] + [
+                _SiriusAnnotatedDataset(
+                    dataset=val_dataset,
+                    class_weights=self.sirius_class_weights,
+                    frame_classes=self.sirius_online_frame_classes[online_idx],
+                )
+                for online_idx, val_dataset in enumerate(online_vals)
+            ]
         mixed_val = _MixedValDataset(
-            datasets=[teleop_val] + online_vals,
+            datasets=split_datasets,
             weights=self.dataset_weights,
         )
         result = {
-            "teleop": teleop_val,
+            "teleop": split_datasets[0],
             "mixed": mixed_val,
         }
         if len(online_vals) > 0:
-            result["hitl"] = online_vals[0]
-        for online_idx, val_dataset in enumerate(online_vals[1:], start=1):
+            result["hitl"] = split_datasets[1]
+        for online_idx, val_dataset in enumerate(split_datasets[2:], start=1):
             result[f"hitl_{online_idx}"] = val_dataset
         return result
+
+    def _prepare_sirius_weighting(self) -> None:
+        if self.sirius_source_fps <= 0:
+            raise ValueError("sirius_source_fps must be positive")
+
+        for online_idx, dataset in enumerate(self.online_datasets):
+            raw_tag = self._get_hitl_tag(dataset)
+            episode_ends = np.asarray(
+                dataset.replay_buffer.episode_ends[:], dtype=np.int64
+            )
+            timestamps = self._get_sirius_timestamps(dataset)
+            merge_gap = (
+                self.sirius_merge_policy_gaps_seconds
+                if self.sirius_tag_debounce_enabled
+                else 0.0
+            )
+            min_intervention = (
+                self.sirius_min_intervention_seconds
+                if self.sirius_tag_debounce_enabled
+                else 0.0
+            )
+            cleaned_tag, audit = clean_intervention_tags(
+                hitl_tag=raw_tag,
+                episode_ends=episode_ends,
+                timestamps=timestamps,
+                merge_policy_gaps_seconds=merge_gap,
+                min_intervention_seconds=min_intervention,
+                fallback_fps=self.sirius_source_fps,
+            )
+            frame_classes = build_online_frame_classes(
+                cleaned_hitl_tag=cleaned_tag,
+                episode_ends=episode_ends,
+                timestamps=timestamps,
+                pre_intervention_seconds=self.sirius_pre_intervention_seconds,
+                fallback_fps=self.sirius_source_fps,
+            )
+            self.sirius_online_frame_classes.append(frame_classes)
+            print(
+                f"[DaggerMixedUmiDataset:online_{online_idx}] Sirius tag audit: "
+                + ", ".join(f"{k}={v}" for k, v in audit.as_dict().items())
+            )
+
+        counts = np.stack(
+            [
+                self._count_sirius_token_classes(dataset_idx, dataset)
+                for dataset_idx, dataset in enumerate(self.datasets)
+            ],
+            axis=0,
+        )
+        proposal, target, weights = compute_sirius_importance_weights(
+            buffer_class_counts=counts,
+            buffer_sampling_weights=self.dataset_weights,
+            target_intervention_fraction=self.sirius_target_intervention_fraction,
+            target_pre_intervention_fraction=(
+                self.sirius_target_pre_intervention_fraction
+            ),
+            max_importance_weight=self.sirius_max_importance_weight,
+        )
+        self.sirius_buffer_class_counts = counts
+        self.sirius_proposal_class_probabilities = proposal
+        self.sirius_target_class_probabilities = target
+        self.sirius_class_weights = weights.astype(np.float32)
+
+        if self.sirius_log_class_stats:
+            for dataset_name, dataset_counts in zip(self.dataset_names, counts):
+                summary = ", ".join(
+                    f"{name}={int(dataset_counts[class_idx])}"
+                    for class_idx, name in enumerate(SIRIUS_CLASS_NAMES)
+                )
+                print(
+                    f"[DaggerMixedUmiDataset:{dataset_name}] "
+                    f"Sirius action-token counts: {summary}"
+                )
+            for class_idx, name in enumerate(SIRIUS_CLASS_NAMES):
+                print(
+                    f"[DaggerMixedUmiDataset] Sirius class={name}: "
+                    f"proposal={proposal[class_idx]:.8f}, "
+                    f"target={target[class_idx]:.8f}, "
+                    f"weight={weights[class_idx]:.8f}"
+                )
+
+    @staticmethod
+    def _get_sirius_timestamps(dataset: UmiDataset) -> Optional[np.ndarray]:
+        if "timestamp" not in dataset.replay_buffer:
+            return None
+        return np.asarray(dataset.replay_buffer["timestamp"][:]).reshape(-1)
+
+    def _get_sirius_token_classes(
+        self,
+        dataset_idx: int,
+        dataset: UmiDataset,
+        mapped_idx: int,
+        action_length: Optional[int] = None,
+    ) -> np.ndarray:
+        horizon = (
+            int(dataset.key_horizon["action"])
+            if action_length is None
+            else int(action_length)
+        )
+        if not self.dataset_is_online[dataset_idx]:
+            return np.full(horizon, SIRIUS_DEMO, dtype=np.int64)
+
+        current_idx, _, episode_end, _ = dataset.sampler.indices[mapped_idx]
+        online_idx = dataset_idx - 1
+        return action_token_classes(
+            frame_classes=self.sirius_online_frame_classes[online_idx],
+            current_idx=int(current_idx),
+            horizon=horizon,
+            stride=int(dataset.key_down_sample_steps["action"]),
+            episode_end=int(episode_end),
+            action_padding=bool(dataset.action_padding),
+        ).astype(np.int64, copy=False)
+
+    def _count_sirius_token_classes(
+        self, dataset_idx: int, dataset: UmiDataset
+    ) -> np.ndarray:
+        """Count the token distribution seen under this dataset's modulo mapping."""
+        counts = np.zeros(SIRIUS_NUM_CLASSES, dtype=np.int64)
+        epoch_length = len(self)
+        horizon = int(dataset.key_horizon["action"])
+        if not self.dataset_is_online[dataset_idx]:
+            counts[SIRIUS_DEMO] = epoch_length * horizon
+            return counts
+
+        for global_start in range(0, epoch_length, 8192):
+            global_end = min(epoch_length, global_start + 8192)
+            for global_idx in range(global_start, global_end):
+                mapped_idx = global_idx % len(dataset)
+                token_classes = self._get_sirius_token_classes(
+                    dataset_idx=dataset_idx,
+                    dataset=dataset,
+                    mapped_idx=mapped_idx,
+                )
+                counts += np.bincount(
+                    token_classes, minlength=SIRIUS_NUM_CLASSES
+                )[:SIRIUS_NUM_CLASSES]
+        return counts
+
+    def _add_sirius_fields(
+        self,
+        sample: Dict[str, torch.Tensor],
+        dataset: UmiDataset,
+        mapped_idx: int,
+        dataset_idx: int,
+    ) -> Dict[str, torch.Tensor]:
+        class_ids = self._get_sirius_token_classes(
+            dataset_idx=dataset_idx,
+            dataset=dataset,
+            mapped_idx=mapped_idx,
+            action_length=sample["action"].shape[0],
+        )
+        sample["action_class_id"] = torch.from_numpy(class_ids)
+        sample["action_loss_weight"] = torch.from_numpy(
+            self.sirius_class_weights[class_ids].astype(np.float32, copy=False)
+        )
+        return sample
 
     def _needs_hitl_tag_filter(self) -> bool:
         return (
@@ -663,6 +917,39 @@ class DaggerMixedUmiDataset(BaseDataset):
         for key in self.rgb_keys:
             normalizer[key] = get_image_identity_normalizer()
         return normalizer
+
+
+class _SiriusAnnotatedDataset(BaseDataset):
+    """Attach deterministic per-action class IDs and weights to a UMI split."""
+
+    def __init__(self, dataset, class_weights, frame_classes=None):
+        self.dataset = dataset
+        self.class_weights = np.asarray(class_weights, dtype=np.float32)
+        self.frame_classes = frame_classes
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int):
+        sample = self.dataset[idx]
+        horizon = int(sample["action"].shape[0])
+        if self.frame_classes is None:
+            class_ids = np.full(horizon, SIRIUS_DEMO, dtype=np.int64)
+        else:
+            current_idx, _, episode_end, _ = self.dataset.sampler.indices[idx]
+            class_ids = action_token_classes(
+                frame_classes=self.frame_classes,
+                current_idx=int(current_idx),
+                horizon=horizon,
+                stride=int(self.dataset.key_down_sample_steps["action"]),
+                episode_end=int(episode_end),
+                action_padding=bool(self.dataset.action_padding),
+            ).astype(np.int64, copy=False)
+        sample["action_class_id"] = torch.from_numpy(class_ids)
+        sample["action_loss_weight"] = torch.from_numpy(
+            self.class_weights[class_ids].astype(np.float32, copy=False)
+        )
+        return sample
 
 
 class _MixedValDataset(BaseDataset):

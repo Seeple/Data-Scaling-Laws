@@ -31,6 +31,7 @@ from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.common.lr_decay import param_groups_lrd
+from diffusion_policy.dataset.sirius_weighting import SIRIUS_CLASS_NAMES
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
@@ -161,6 +162,25 @@ class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset) or isinstance(dataset, BaseDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        sirius_weighting_enabled = bool(
+            getattr(dataset, "sirius_weighting_enabled", False)
+        )
+        sirius_target_probabilities = getattr(
+            dataset, "sirius_target_class_probabilities", None
+        )
+        if sirius_weighting_enabled:
+            static_metrics = {}
+            for class_idx, class_name in enumerate(SIRIUS_CLASS_NAMES):
+                static_metrics[f"sirius/proposal_{class_name}"] = float(
+                    dataset.sirius_proposal_class_probabilities[class_idx]
+                )
+                static_metrics[f"sirius/target_{class_name}"] = float(
+                    dataset.sirius_target_class_probabilities[class_idx]
+                )
+                static_metrics[f"sirius/weight_{class_name}"] = float(
+                    dataset.sirius_class_weights[class_idx]
+                )
+            accelerator.log(static_metrics, step=self.global_step)
 
         # compute normalizer on the main process and save to disk
         normalizer_path = os.path.join(self.output_dir, 'normalizer.pkl')
@@ -238,8 +258,13 @@ class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
             assert cfg.training.checkpoint_every >= cfg.training.wild_sample_every and cfg.training.checkpoint_every % cfg.training.wild_sample_every == 0
             assert cfg.training.num_epochs // cfg.training.wild_sample_every <= 30
         else:
-            # prefer mixed validation for ranking
-            cfg.checkpoint.topk.monitor_key = 'val_mixed_action_mse_error'
+            # Sirius ranks checkpoints against its target class distribution;
+            # legacy DAgger continues to use the unweighted mixed validation MSE.
+            cfg.checkpoint.topk.monitor_key = (
+                'val_sirius_composite_action_mse'
+                if sirius_weighting_enabled
+                else 'val_mixed_action_mse_error'
+            )
             assert cfg.training.checkpoint_every >= cfg.training.sample_every and cfg.training.checkpoint_every % cfg.training.sample_every == 0
         cfg.checkpoint.topk.format_str = 'epoch={epoch:04d}-' + cfg.checkpoint.topk.monitor_key + '={' + cfg.checkpoint.topk.monitor_key + ':.5f}.ckpt'
         topk_manager = TopKCheckpointManager(
@@ -504,22 +529,74 @@ class TrainDiffusionUnetImageDaggerWorkspace(BaseWorkspace):
                         all_preds, all_gt = accelerator.gather_for_metrics((pred_action, gt_action))
                         log_action_mse(step_log, 'train', all_preds, all_gt)
 
+                        sirius_class_sse = torch.zeros(
+                            len(SIRIUS_CLASS_NAMES), dtype=torch.float64, device=device
+                        )
+                        sirius_class_count = torch.zeros(
+                            len(SIRIUS_CLASS_NAMES), dtype=torch.float64, device=device
+                        )
                         for split_name, loader in val_dataloaders.items():
                             action_mse_error_list, action_mse_error_pos_list, action_mse_error_rot_list, action_mse_error_width_list = [], [], [], []
                             for val_sampling_batch in tqdm.tqdm(loader):
                                 batch = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
                                 gt_action = batch['action']
                                 pred_action = policy.predict_action(batch['obs'], None)['action_pred']
-                                all_preds, all_gt = accelerator.gather_for_metrics((pred_action, gt_action))
+                                if sirius_weighting_enabled and "action_class_id" in batch:
+                                    all_preds, all_gt, all_class_ids = accelerator.gather_for_metrics(
+                                        (pred_action, gt_action, batch["action_class_id"])
+                                    )
+                                else:
+                                    all_preds, all_gt = accelerator.gather_for_metrics((pred_action, gt_action))
+                                    all_class_ids = None
                                 action_mse_error, action_mse_error_pos, action_mse_error_rot, action_mse_error_width = cal_action_mse(all_preds, all_gt)
                                 action_mse_error_list.append(action_mse_error)
                                 action_mse_error_pos_list.append(action_mse_error_pos)
                                 action_mse_error_rot_list.append(action_mse_error_rot)
                                 action_mse_error_width_list.append(action_mse_error_width)
+                                if (
+                                    sirius_weighting_enabled
+                                    and split_name != "mixed"
+                                    and all_class_ids is not None
+                                ):
+                                    token_mse = (all_preds - all_gt).pow(2).mean(dim=-1)
+                                    for class_idx in range(len(SIRIUS_CLASS_NAMES)):
+                                        class_mask = all_class_ids == class_idx
+                                        sirius_class_sse[class_idx] += token_mse[
+                                            class_mask
+                                        ].double().sum()
+                                        sirius_class_count[class_idx] += class_mask.sum().double()
                             step_log[f'val/{split_name}_action_mse_error'] = torch.mean(torch.stack(action_mse_error_list)).item()
                             step_log[f'val_{split_name}_action_mse_error_pos'] = torch.mean(torch.stack(action_mse_error_pos_list)).item()
                             step_log[f'val_{split_name}_action_mse_error_rot'] = torch.mean(torch.stack(action_mse_error_rot_list)).item()
                             step_log[f'val_{split_name}_action_mse_error_width'] = torch.mean(torch.stack(action_mse_error_width_list)).item()
+
+                        if sirius_weighting_enabled:
+                            composite = 0.0
+                            for class_idx, class_name in enumerate(SIRIUS_CLASS_NAMES):
+                                count = float(sirius_class_count[class_idx].item())
+                                target_probability = float(
+                                    sirius_target_probabilities[class_idx]
+                                )
+                                if count <= 0:
+                                    if target_probability > 0:
+                                        raise RuntimeError(
+                                            "Validation split has no samples for Sirius "
+                                            f"class '{class_name}' with positive target mass"
+                                        )
+                                    continue
+                                class_mse = float(
+                                    (
+                                        sirius_class_sse[class_idx]
+                                        / sirius_class_count[class_idx]
+                                    ).item()
+                                )
+                                step_log[
+                                    f'val_sirius_{class_name}_action_mse'
+                                ] = class_mse
+                                composite += target_probability * class_mse
+                            step_log[
+                                'val_sirius_composite_action_mse'
+                            ] = composite
 
                         del batch
                         del gt_action
