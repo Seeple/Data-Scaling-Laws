@@ -24,6 +24,19 @@ Pingyue Sheng<sup>1</sup>,
 
 <sup>\*</sup> indicates equal contributions
 
+## ARISE training fork
+
+This release branch combines ordinary DP/DAgger, Sirius weighted finetuning
+and chunk/step residual training for `hang_chinese_knot`, `manage_table` and
+`cable_routing`. Use the [unified training guide](docs/arise-training.md) for
+portable launch arguments, local YAML recipes, dry runs and input checks.
+
+```bash
+python -m diffusion_policy.launch --help
+```
+
+The original task scripts and upstream project documentation remain below.
+
 ## 🛠️ Installation
 See the [UMI repository](https://github.com/real-stanford/universal_manipulation_interface) for installation. 
 

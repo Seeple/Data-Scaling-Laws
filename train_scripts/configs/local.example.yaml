@@ -1,0 +1,18 @@
+# Copy to local.yaml (ignored). Paths are relative to this YAML, CLI paths to cwd.
+task: manage_table
+method: dagger
+teleop_dataset: /path/to/expert.zarr.zip
+online_datasets:
+  - /path/to/hitl-round1.zarr.zip
+checkpoint: /path/to/base.ckpt
+gpus: '0'
+num_workers: 8
+val_num_workers: 4
+wandb: false
+pretrained: false
+# cache_dir: /path/to/ssd/cache  # optional; requires lmdb
+# run_dir: /path/to/output      # omit for unique outputs/task/method/timestamp
+overrides:
+  - task.dataset.hitl_only_tag=true
+  - task.dataset.hitl_action_mask=true
+  - task.dataset.hitl_contiguous_action_mask=true

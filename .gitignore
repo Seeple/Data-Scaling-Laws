@@ -175,3 +175,6 @@ ckpt
 pretrained_model
 test_script
 test
+
+# Local training station settings
+/train_scripts/configs/local.yaml
