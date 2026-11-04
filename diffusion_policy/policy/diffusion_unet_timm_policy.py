@@ -119,7 +119,12 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor], fixed_action_prefix: torch.Tensor=None) -> Dict[str, torch.Tensor]:
+    def predict_action(
+            self,
+            obs_dict: Dict[str, torch.Tensor],
+            fixed_action_prefix: torch.Tensor=None,
+            return_obs_features: bool=False,
+        ) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         fixed_action_prefix: unnormalized action prefix
@@ -160,6 +165,11 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             'action': action_pred,
             'action_pred': action_pred
         }
+        # Residual-policy deployment needs the exact frozen-base observation
+        # feature that produced this action chunk.  The opt-in flag keeps the
+        # legacy inference API and its returned dictionary unchanged.
+        if return_obs_features:
+            result['obs_features'] = global_cond
         return result
 
     # ========= training  ============
