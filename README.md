@@ -1,91 +1,116 @@
-# Data Scaling Laws in Imitation Learning for Robotic Manipulation
+# ARISE Training — Data-Scaling-Laws fork
 
-[[Project Page]](https://data-scaling-laws.github.io/)
-[[Paper]](https://data-scaling-laws.github.io/paper.pdf)
-[[Models]](https://huggingface.co/Fanqi-Lin/Task-Models/tree/main)
-[[Processed Dataset]](https://huggingface.co/datasets/Fanqi-Lin/Processed-Task-Dataset/tree/main)
-[[Raw GoPro Videos]](https://huggingface.co/datasets/Fanqi-Lin/GoPro-Raw-Videos)
+This fork supplies the training backend used by
+[ARISE](https://github.com/Seeple/ARISE): ordinary Diffusion Policy training,
+human-gated DAgger, Sirius weighted finetuning and residual-policy updates.
+It is based on [Data-Scaling-Laws](https://github.com/Fanqi-Lin/Data-Scaling-Laws),
+which builds on UMI and Diffusion Policy. The reusable intervention, VR editing
+and real-robot deployment code lives in ARISE.
 
-<p>
-    <img src="./assets/wild-data.gif" alt="wild-data" width="45%" />
-    <img src="./assets/wild-eval.gif" alt="wild-eval" width="45%" />
-</p>
+The release code is maintained on `arise-release`. ARISE consumes this fork as
+`third_party/data-scaling-laws`, pinned to a tested commit. A branch name is
+for development; the parent repository's gitlink selects the reproducible version.
 
-[Fanqi Lin](https://fanqi-lin.github.io/)<sup>1,2,3\*</sup>,
-[Yingdong Hu](https://yingdong-hu.github.io/)<sup>1,2,3\*</sup>,
-Pingyue Sheng<sup>1</sup>,
-[Chuan Wen](https://alvinwen428.github.io/)<sup>1,2,3</sup>,
-[Jiacheng You](https://scholar.google.com/citations?user=FiP-TVUAAAAJ)<sup>1</sup>,
-[Yang Gao](https://yang-gao.weebly.com/)<sup>1,2,3</sup>,
+## What this fork adds
 
-<sup>1</sup>Tsinghua University,
-<sup>2</sup>Shanghai Qi Zhi Institute,
-<sup>3</sup>Shanghai Artificial Intelligence Laboratory
+- DP finetuning with offline/online replay, human-only anchors, action masks,
+  contiguous-prefix and invalid-tail options, and observation/action strides.
+- Sirius intervention-aware token weights over complete online rollouts.
+- Frozen-base geometric residual policies, full-chunk/active-suffix and dense
+  step datasets, later-round replay and warm starts, and multibase augmentation.
+- Shared launch arguments and method-level shell recipes, local overrides,
+  config-only checks, reproducible launch metadata and training logs.
 
-<sup>\*</sup> indicates equal contributions
+These extensions retain the upstream `diffusion_policy` and `umi` namespaces
+for checkpoint and deployment compatibility. No robot SDK or model weights are
+distributed here.
 
-## ARISE training fork
+## Get the code and environment
 
-This release branch combines ordinary DP/DAgger, Sirius weighted finetuning
-and chunk/step residual training for `hang_chinese_knot`, `manage_table` and
-`cable_routing`. Use the [unified training guide](docs/arise-training.md) for
-portable launch arguments, [method-level shell recipes](train_scripts/configs/README.md),
-local YAML recipes, dry runs and input checks.
+As part of ARISE, run from the ARISE repository root:
 
 ```bash
-python -m diffusion_policy.launch --help
+git submodule update --init --recursive third_party/data-scaling-laws
 ```
 
-Selected legacy task scripts and the upstream project documentation remain below.
+Or clone this fork directly and check out `arise-release`.
+Use a compatible training environment based on `conda_environment.yaml`.
+An existing inference environment can often be reused after checking training
+dependencies. From this repository's root, Python can import `diffusion_policy`
+and `umi` directly. For ARISE deployment from its parent directory, expose this
+submodule root on `PYTHONPATH` as described in the ARISE deployment guide.
 
-## 🛠️ Installation
-See the [UMI repository](https://github.com/real-stanford/universal_manipulation_interface) for installation. 
+## Start a training run
 
-## 📷 Data
-We release data for all four of our tasks: *pour water, arrange mouse, fold towel*, and *unplug charger*. You can view or download all raw GoPro videos from this [link](https://huggingface.co/datasets/Fanqi-Lin/GoPro-Raw-Videos), and generate the dataset for training by running:
+The method-level scripts share one set of settings across task names:
 
-```shell
-bash run_slam.sh && bash run_generate_dataset.sh
+| Script under `train_scripts/configs/` | Workflow |
+| --- | --- |
+| `base-model.sh` | Ordinary DP training |
+| `hg-dagger.sh` | Human-gated policy finetuning |
+| `sirius.sh` | Complete-rollout Sirius weighted finetuning |
+| `residual-policy.sh` | First-round full-chunk residual |
+| `residual-policy-round2.sh` | Residual replay and weight warm start |
+| `residual-policy-step.sh` | Dense step residual, horizon 1 or 5 |
+
+For example, from this repository's root:
+
+```bash
+bash train_scripts/configs/base-model.sh --dry-run --print-config
+bash train_scripts/configs/hg-dagger.sh --check
+bash train_scripts/configs/residual-policy.sh --variant mixed_gate --dry-run
 ```
 
-Alternatively, we provide processed dataset [here](https://huggingface.co/datasets/Fanqi-Lin/Processed-Task-Dataset/tree/main), ready for direct use in training.
+`--dry-run` composes the workspace and prints the command without starting a
+job. `--check` also checks input-file presence and import availability, without
+loading checkpoints. Remove these flags to train after supplying real inputs.
+Recipes use repository-relative `data/dataset/` and `data/ckpts/` paths; edit
+the settings or override them with environment values/launcher arguments.
+The data directory and weights are ignored by Git.
 
-You can visualize the dataset with a simple script:
-```shell
-python visualize_dataset.py
+See the [shell recipe guide](train_scripts/configs/README.md) for the expected
+file layout, switches, GPU settings and overrides, and the
+[training guide](docs/arise-training.md) for Python/YAML launch recipes,
+sampling contracts, replay, normalization and resume.
+
+## Data and deployment contracts
+
+Ordinary DP/DAgger use fixed-rate UMI Zarr data. Sirius needs complete policy
+and takeover rollouts with `hitl_tag`, rather than only extracted corrections.
+The ARISE HDF5/MP4 converters prepare these experiment datasets.
+
+Residual inputs are event datasets containing the exact frozen-base reference,
+human/composite targets and validity masks. `recorded_chunk`,
+`active_suffix_left_aligned` and `step_active_plan_left_aligned` are different
+contracts. Match the checkpoint's action alignment, frozen-base SHA256 and
+state key to deployment. ARISE's default residual preset selects full-chunk
+`recorded_chunk`; another alignment requires an explicit matching configuration.
+Keeping step residual training here does not add a step deployment adapter.
+
+Checkpoints, normalization assets and example datasets must be supplied
+separately. Paths in the historical task scripts describe their original
+experiments; new runs should use the method-level recipes above.
+
+## Validation
+
+```bash
+python -m pytest -q tests/common tests/dataset tests/model tests/training
 ```
 
-## 🦾 Real-World Evaluation
-For the hardware setup, please refer to the [UMI repo](https://github.com/real-stanford/universal_manipulation_interface) (note: we remove the mirror from the gripper, see [link](https://drive.google.com/drive/folders/1DLGfRWYvODOnHwn9Ye-xWlYhXk0WwBGG?usp=sharing)).
+This focused suite uses temporary data, CPU tensors and configuration
+composition. It includes model loss/gradient and feature-return regressions,
+residual dataset contracts, launch errors and shell path handling. Hardware
+camera tests and full training jobs are separate.
 
-For each task, we release a policy trained on data collected from 32 unique environment-object pairs, with 50 demonstrations per environment. These polices generalize well to any new environment and new object. You can download them from [link](https://huggingface.co/Fanqi-Lin/Task-Models/tree/main) and run real-world evaluation using:
+## Upstream attribution
 
-```shell
-bash eval.sh
-```
+The underlying training framework is the work of the
+[Data-Scaling-Laws authors](https://data-scaling-laws.github.io/), based on
+[UMI](https://github.com/real-stanford/universal_manipulation_interface) and
+[Diffusion Policy](https://github.com/real-stanford/diffusion_policy).
+Please cite those works when using their methods, together with ARISE when
+using its contributions. The upstream paper, authors, original models/data
+links and reproduction instructions are retained in the
+[upstream project README](docs/UPSTREAM_README.md).
 
-The ```temporal_agg``` parameter in eval.sh refers to temporal ensemble strategy mentioned in our paper, enabling smoother robot actions.
-
-Additionally, you can use the ```-j``` parameter to reset the robot arm to a fixed initial position (make sure that the initial joint configuration specified in ```example/eval_robots_config.yaml``` is safe for your robot !!!).
-
-## 📊 Reproducing Data Scaling Laws
-After downloading the [processed dataset](https://huggingface.co/datasets/Fanqi-Lin/Processed-Task-Dataset/tree/main), you can train a policy by running:
-
-```shell
-cd train_scripts && bash <task_name>.sh
-```
-
-For multi-GPU training, configure your setup with ```accelerate config```, then replace ```python``` with ```accelerate launch``` in the ```<task_name>.sh``` script. Additionally, you can speed up training without sacrificing policy performance by adding the ```--mixed_precision 'bf16'``` argument.
-
-Note that for the pour_water and unplug_charger tasks, we incorporate an additional step of historical observation for policy training and inference.
-
-The current parameters in the ```<task_name.sh>``` scripts correspond to our released [models](https://huggingface.co/Fanqi-Lin/Task-Models/tree/main), but you can customize training:
-+ Use ```policy.obs_encoder.model_name``` to specify the type of vision encoder for the diffusion policy. Other options include ```vit_base_patch14_dinov2.lvd142m``` (DINOv2 ViT-Base) and ```vit_large_patch14_clip_224.openai``` (CLIP ViT-Large).
-+ To adjust the number of training environment-object pairs (up to a maximum of 32), modify ```task.dataset.dataset_idx```. You can change the proportion of demonstrations used by adjusting ```task.dataset.use_ratio``` within the range (0, 1]. Training policies on data from different environment-object pairs, using 100% of the demonstrations, generates scaling curves similar to the following:
-
-<img width="90%" src="assets/scaling-law-curve.png">
-
-The curve (third column) shows that the policy’s ability to generalize to new environments and objects scales approximately as a power law with the number of training environment-object pairs.
-
-## 🙏 Acknowledgement
-We thank the authors of [UMI](https://github.com/real-stanford/universal_manipulation_interface) for sharing their codebase.
+The existing [MIT license and copyright notice](LICENSE) are preserved.
