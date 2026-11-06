@@ -1,8 +1,9 @@
 # ARISE training workflows
 
 This fork combines the ordinary DP/DAgger, Sirius and residual training
-branches. The original task scripts remain as experiment records. Use the
-shared launcher for new runs; it does not require changing those scripts.
+branches. Selected legacy task scripts remain as experiment records; unused
+task scripts have been removed. Use the method-level shell recipes or the
+shared Python launcher for new runs.
 
 ## Environment and entry point
 
@@ -34,6 +35,27 @@ All methods accept `hang_chinese_knot`, `manage_table` and `cable_routing`.
 Task selection controls run naming and ordinary training batch/epoch defaults;
 the same single-arm UMI shape contract is used. The new cable pretraining
 recipe is generic: the original master supplied only its DAgger script.
+
+## Method-level shell recipes
+
+For editable, version-controlled shell settings, use
+[`train_scripts/configs/`](../train_scripts/configs/README.md):
+
+```bash
+bash train_scripts/configs/base-model.sh --dry-run --print-config
+bash train_scripts/configs/hg-dagger.sh --check
+bash train_scripts/configs/sirius.sh --dry-run
+bash train_scripts/configs/residual-policy.sh --dry-run
+bash train_scripts/configs/residual-policy-round2.sh --dry-run
+RESIDUAL_HORIZON=1 bash train_scripts/configs/residual-policy-step.sh --dry-run
+```
+
+Each method has one recipe across task names. The shell recipes resolve paths
+from the repository root even when invoked from another working directory.
+They default to a portable `data/dataset/` and `data/ckpts/` layout; supply the
+actual artifacts or change their path settings before training. Their W&B and
+HG-DAgger switches follow the older shell entry points. The independent Python
+launcher keeps its CLI/YAML path and logging conventions described below.
 
 ## Launch examples
 
